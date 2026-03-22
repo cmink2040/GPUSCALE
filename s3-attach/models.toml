@@ -1,0 +1,43 @@
+# Models configuration for GPUSCALE benchmark suite.
+#
+# Each [[models]] entry defines a model to sync to the Wasabi S3 bucket.
+# - repo_id: Canonical model identifier (org/model), used for bucket layout
+# - source: Download source — "meta" for Meta's official distribution, "huggingface" (default)
+# - meta_model_id: Meta CLI model ID (required when source = "meta")
+# - formats: list of format tables, each with a "type" key
+#   - type = "full"  → download full-weight checkpoint (FP16/BF16)
+#   - type = "gguf"  → download GGUF quantized files; specify "quants" list
+#   - type = "gptq"  → download from a GPTQ repo; specify "variant" and optional "repo_suffix"
+#
+# To add a model to the benchmark, add a new [[models]] block below.
+
+[[models]]
+repo_id = "meta-llama/Llama-3.1-8B-Instruct"
+source = "meta"
+meta_model_id = "llama3.1-8b-instruct"
+
+    [[models.formats]]
+    type = "full"
+
+    [[models.formats]]
+    type = "gguf"
+    quants = ["Q4_K_M", "Q8_0"]
+    # GGUF quants are typically from community repos, not Meta directly.
+    # Set gguf_repo_id to pull from a known quantized source.
+    # gguf_repo_id = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+
+    [[models.formats]]
+    type = "gptq"
+    variant = "4bit-128g"
+    # GPTQ quants are also typically community-provided.
+    # gptq_repo_id = "TheBloke/Llama-3.1-8B-Instruct-GPTQ"
+
+[[models]]
+repo_id = "mistralai/Mistral-7B-Instruct-v0.3"
+
+    [[models.formats]]
+    type = "full"
+
+    [[models.formats]]
+    type = "gguf"
+    quants = ["Q4_K_M", "Q5_K_M"]
