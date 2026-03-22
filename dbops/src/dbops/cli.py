@@ -1,4 +1,4 @@
-"""CLI entrypoint for dbops — submit, list, flag, delete, init-db."""
+"""CLI entrypoint for dbops — submit, list, flag, delete, migrate."""
 
 from __future__ import annotations
 
@@ -11,18 +11,19 @@ from rich.console import Console
 from rich.table import Table
 
 from dbops import db, validate
-from dbops.models import Engine, Provider
+from dbops.models import Engine as EngineEnum
+from dbops.models import Provider
 
 console = Console()
 error_console = Console(stderr=True)
 
-SCHEMA_SQL_PATH = Path(__file__).parent / "schema.sql"
+ALEMBIC_DIR = Path(__file__).parent.parent.parent / "alembic"
 
 
 @click.group()
 @click.version_option(package_name="gpuscale-dbops")
 def cli() -> None:
-    """GPUSCALE dbops — manage GPU benchmark results in Supabase."""
+    """GPUSCALE dbops — manage GPU benchmark results."""
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +34,6 @@ def cli() -> None:
 @click.option("--dry-run", is_flag=True, help="Validate only, do not insert.")
 def submit(json_file: Path, dry_run: bool) -> None:
     """Submit a benchmark result from a JSON file."""
-    # Load
     data, load_err = validate.load_json_file(json_file)
     if load_err:
         error_console.print(f"[red]Error:[/red] {load_err}")
@@ -41,7 +41,6 @@ def submit(json_file: Path, dry_run: bool) -> None:
 
     assert data is not None
 
-    # Validate
     result, report = validate.validate_result(data)
 
     for w in report.warnings:
@@ -60,10 +59,10 @@ def submit(json_file: Path, dry_run: bool) -> None:
         console.print("[dim]Dry run — nothing inserted.[/dim]")
         return
 
-    # Insert
-    client = db.get_client()
-    row = db.insert_result(client, result.to_insert_dict())
-    console.print(f"[green]Inserted:[/green] id={row['id']}")
+    orm_obj = result.to_orm()
+    with db.get_session() as session:
+        row = db.insert_result(session, orm_obj)
+        console.print(f"[green]Inserted:[/green] id={row.id}")
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +75,7 @@ def submit(json_file: Path, dry_run: bool) -> None:
 @click.option(
     "--engine",
     default=None,
-    type=click.Choice([e.value for e in Engine], case_sensitive=False),
+    type=click.Choice([e.value for e in EngineEnum], case_sensitive=False),
     help="Filter by engine.",
 )
 @click.option(
@@ -95,51 +94,51 @@ def list_results(
     quant: Optional[str],
 ) -> None:
     """List recent benchmark results with optional filters."""
-    client = db.get_client()
-    rows = db.list_results(
-        client,
-        limit=limit,
-        gpu_name=gpu,
-        model_name=model,
-        engine=engine,
-        provider=provider,
-        quantization=quant,
-    )
-
-    if not rows:
-        console.print("[dim]No results found.[/dim]")
-        return
-
-    table = Table(title=f"Benchmark Results ({len(rows)})", show_lines=False)
-    table.add_column("ID", style="dim", max_width=8)
-    table.add_column("GPU")
-    table.add_column("Model")
-    table.add_column("Engine")
-    table.add_column("Quant")
-    table.add_column("Provider")
-    table.add_column("tok/s", justify="right")
-    table.add_column("TTFT ms", justify="right")
-    table.add_column("Flagged")
-    table.add_column("Created", style="dim")
-
-    for r in rows:
-        rid = str(r["id"])[:8]
-        flagged_str = "[red]YES[/red]" if r.get("flagged") else ""
-        created = str(r.get("created_at", ""))[:19]
-        table.add_row(
-            rid,
-            r.get("gpu_name", ""),
-            r.get("model_name", ""),
-            r.get("engine", ""),
-            r.get("quantization", ""),
-            r.get("provider", ""),
-            f"{r.get('tokens_per_sec', 0):.1f}",
-            f"{r.get('time_to_first_token_ms', 0):.1f}",
-            flagged_str,
-            created,
+    with db.get_session() as session:
+        rows = db.list_results(
+            session,
+            limit=limit,
+            gpu_name=gpu,
+            model_name=model,
+            engine=engine,
+            provider=provider,
+            quantization=quant,
         )
 
-    console.print(table)
+        if not rows:
+            console.print("[dim]No results found.[/dim]")
+            return
+
+        table = Table(title=f"Benchmark Results ({len(rows)})", show_lines=False)
+        table.add_column("ID", style="dim", max_width=8)
+        table.add_column("GPU")
+        table.add_column("Model")
+        table.add_column("Engine")
+        table.add_column("Quant")
+        table.add_column("Provider")
+        table.add_column("tok/s", justify="right")
+        table.add_column("TTFT ms", justify="right")
+        table.add_column("Flagged")
+        table.add_column("Created", style="dim")
+
+        for r in rows:
+            rid = str(r.id)[:8]
+            flagged_str = "[red]YES[/red]" if r.flagged else ""
+            created = str(r.created_at)[:19] if r.created_at else ""
+            table.add_row(
+                rid,
+                r.gpu_name or "",
+                r.model_name or "",
+                r.engine or "",
+                r.quantization or "",
+                r.provider or "",
+                f"{r.tokens_per_sec:.1f}" if r.tokens_per_sec else "",
+                f"{r.time_to_first_token_ms:.1f}" if r.time_to_first_token_ms else "",
+                flagged_str,
+                created,
+            )
+
+        console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +148,13 @@ def list_results(
 @click.argument("result_id")
 def flag(result_id: str) -> None:
     """Flag a suspicious benchmark result by ID."""
-    client = db.get_client()
-    row = db.flag_result(client, result_id)
-    if row:
-        console.print(f"[yellow]Flagged:[/yellow] {row['id']}")
-    else:
-        error_console.print(f"[red]Not found:[/red] {result_id}")
-        sys.exit(1)
+    with db.get_session() as session:
+        row = db.flag_result(session, result_id)
+        if row:
+            console.print(f"[yellow]Flagged:[/yellow] {row.id}")
+        else:
+            error_console.print(f"[red]Not found:[/red] {result_id}")
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -169,29 +168,60 @@ def delete(result_id: str, yes: bool) -> None:
     if not yes:
         click.confirm(f"Delete result {result_id}?", abort=True)
 
-    client = db.get_client()
-    row = db.delete_result(client, result_id)
-    if row:
-        console.print(f"[red]Deleted:[/red] {row['id']}")
-    else:
-        error_console.print(f"[red]Not found:[/red] {result_id}")
+    with db.get_session() as session:
+        row = db.delete_result(session, result_id)
+        if row:
+            console.print(f"[red]Deleted:[/red] {row.id}")
+        else:
+            error_console.print(f"[red]Not found:[/red] {result_id}")
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# migrate
+# ---------------------------------------------------------------------------
+@cli.command()
+@click.option("--revision", default="head", help="Target revision (default: head).")
+def migrate(revision: str) -> None:
+    """Run Alembic migrations to bring the database schema up to date."""
+    from alembic import command
+    from alembic.config import Config
+
+    alembic_ini = ALEMBIC_DIR.parent / "alembic.ini"
+    if not alembic_ini.exists():
+        error_console.print(f"[red]Error:[/red] alembic.ini not found at {alembic_ini}")
         sys.exit(1)
 
+    alembic_cfg = Config(str(alembic_ini))
+    alembic_cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+
+    console.print(f"[dim]Running migrations to revision: {revision}[/dim]")
+    command.upgrade(alembic_cfg, revision)
+    console.print("[green]Migrations complete.[/green]")
+
 
 # ---------------------------------------------------------------------------
-# init-db
+# revision (create new migration)
 # ---------------------------------------------------------------------------
-@cli.command("init-db")
-@click.option("--output", "-o", type=click.Path(path_type=Path), default=None, help="Write SQL to file.")
-def init_db(output: Optional[Path]) -> None:
-    """Print or save the SQL schema for the benchmark_results table."""
-    sql = SCHEMA_SQL_PATH.read_text()
+@cli.command()
+@click.argument("message")
+@click.option("--autogenerate/--no-autogenerate", default=True, help="Auto-detect model changes.")
+def revision(message: str, autogenerate: bool) -> None:
+    """Create a new Alembic migration revision."""
+    from alembic import command
+    from alembic.config import Config
 
-    if output:
-        output.write_text(sql)
-        console.print(f"[green]Schema written to:[/green] {output}")
-    else:
-        console.print(sql)
+    alembic_ini = ALEMBIC_DIR.parent / "alembic.ini"
+    if not alembic_ini.exists():
+        error_console.print(f"[red]Error:[/red] alembic.ini not found at {alembic_ini}")
+        sys.exit(1)
+
+    alembic_cfg = Config(str(alembic_ini))
+    alembic_cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+
+    console.print(f"[dim]Creating revision: {message}[/dim]")
+    command.revision(alembic_cfg, message=message, autogenerate=autogenerate)
+    console.print("[green]Revision created.[/green]")
 
 
 if __name__ == "__main__":

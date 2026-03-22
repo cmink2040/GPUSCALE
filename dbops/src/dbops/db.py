@@ -1,39 +1,82 @@
-"""Supabase client wrapper — connection init, insert, query, flag, delete."""
+"""SQLAlchemy database engine, session, and query helpers."""
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import Any
+from contextlib import contextmanager
+from typing import Generator
 
-from supabase import Client, create_client
+from sqlalchemy import create_engine, desc, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
-TABLE = "benchmark_results"
+from dbops.models import BenchmarkResult
+
+_engine: Engine | None = None
+_SessionFactory: sessionmaker[Session] | None = None
 
 
-def _get_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        print(f"Error: environment variable {name} is not set.", file=sys.stderr)
+def _get_database_url() -> str:
+    url = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_URL")
+    if not url:
+        print(
+            "Error: DATABASE_URL or SUPABASE_URL environment variable is not set.",
+            file=sys.stderr,
+        )
+        print(
+            "Set it to your Supabase Postgres connection string, e.g.:",
+            file=sys.stderr,
+        )
+        print(
+            "  postgresql://postgres.<ref>:<password>@<host>:5432/postgres",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    return value
+    return url
 
 
-def get_client() -> Client:
-    """Create and return a Supabase client using service-role credentials."""
-    url = _get_env("SUPABASE_URL")
-    key = _get_env("SUPABASE_SERVICE_KEY")
-    return create_client(url, key)
+def get_engine() -> Engine:
+    """Get or create the SQLAlchemy engine."""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(_get_database_url(), echo=False, pool_pre_ping=True)
+    return _engine
 
 
-def insert_result(client: Client, data: dict[str, Any]) -> dict[str, Any]:
-    """Insert a validated benchmark result. Returns the inserted row."""
-    response = client.table(TABLE).insert(data).execute()
-    return response.data[0]
+def get_session_factory() -> sessionmaker[Session]:
+    """Get or create the session factory."""
+    global _SessionFactory
+    if _SessionFactory is None:
+        _SessionFactory = sessionmaker(bind=get_engine())
+    return _SessionFactory
+
+
+@contextmanager
+def get_session() -> Generator[Session, None, None]:
+    """Provide a transactional session scope."""
+    factory = get_session_factory()
+    session = factory()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def insert_result(session: Session, result: BenchmarkResult) -> BenchmarkResult:
+    """Insert a benchmark result. Returns the instance with id/created_at populated."""
+    session.add(result)
+    session.flush()
+    session.refresh(result)
+    return result
 
 
 def list_results(
-    client: Client,
+    session: Session,
     *,
     limit: int = 25,
     gpu_name: str | None = None,
@@ -41,47 +84,40 @@ def list_results(
     engine: str | None = None,
     provider: str | None = None,
     quantization: str | None = None,
-) -> list[dict[str, Any]]:
+) -> list[BenchmarkResult]:
     """Query benchmark results with optional filters, ordered by newest first."""
-    query = client.table(TABLE).select("*")
+    stmt = select(BenchmarkResult)
 
     if gpu_name:
-        query = query.ilike("gpu_name", f"%{gpu_name}%")
+        stmt = stmt.where(BenchmarkResult.gpu_name.ilike(f"%{gpu_name}%"))
     if model_name:
-        query = query.ilike("model_name", f"%{model_name}%")
+        stmt = stmt.where(BenchmarkResult.model_name.ilike(f"%{model_name}%"))
     if engine:
-        query = query.eq("engine", engine)
+        stmt = stmt.where(BenchmarkResult.engine == engine)
     if provider:
-        query = query.eq("provider", provider)
+        stmt = stmt.where(BenchmarkResult.provider == provider)
     if quantization:
-        query = query.ilike("quantization", f"%{quantization}%")
+        stmt = stmt.where(BenchmarkResult.quantization.ilike(f"%{quantization}%"))
 
-    query = query.order("created_at", desc=True).limit(limit)
-    response = query.execute()
-    return response.data
-
-
-def flag_result(client: Client, result_id: str) -> dict[str, Any] | None:
-    """Flag a result as suspicious. Returns the updated row or None if not found."""
-    response = (
-        client.table(TABLE)
-        .update({"flagged": True})
-        .eq("id", result_id)
-        .execute()
-    )
-    if response.data:
-        return response.data[0]
-    return None
+    stmt = stmt.order_by(desc(BenchmarkResult.created_at)).limit(limit)
+    return list(session.scalars(stmt).all())
 
 
-def delete_result(client: Client, result_id: str) -> dict[str, Any] | None:
-    """Delete a result by ID. Returns the deleted row or None if not found."""
-    response = (
-        client.table(TABLE)
-        .delete()
-        .eq("id", result_id)
-        .execute()
-    )
-    if response.data:
-        return response.data[0]
-    return None
+def flag_result(session: Session, result_id: str) -> BenchmarkResult | None:
+    """Flag a result as suspicious. Returns the updated row or None."""
+    result = session.get(BenchmarkResult, result_id)
+    if result is None:
+        return None
+    result.flagged = True
+    session.flush()
+    return result
+
+
+def delete_result(session: Session, result_id: str) -> BenchmarkResult | None:
+    """Delete a result by ID. Returns the deleted row or None."""
+    result = session.get(BenchmarkResult, result_id)
+    if result is None:
+        return None
+    session.delete(result)
+    session.flush()
+    return result
