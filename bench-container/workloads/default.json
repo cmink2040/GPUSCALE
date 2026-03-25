@@ -1,0 +1,16 @@
+{
+  "workload_version": "1.0",
+  "prompts": [
+    {
+      "role": "user",
+      "content": "Explain the concept of GPU memory bandwidth and how it affects large language model inference performance. Include specific examples of how different memory types (HBM2e, GDDR6X) compare in real-world LLM serving scenarios."
+    }
+  ],
+  "generation_params": {
+    "max_tokens": 512,
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "iterations": 5,
+  "warmup_iterations": 1
+}

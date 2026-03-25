@@ -7,26 +7,51 @@ The goal is to produce comparable, reproducible performance data so users can ma
 ## Architecture
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+                        ┌──────────────┐
+                        │  HuggingFace │  Public models pulled
+                        │  Hub         │  directly by runner
+                        └──────┬───────┘
+                               │
+┌──────────────┐     ┌─────────▼────┐     ┌──────────────┐     ┌──────────────┐
 │  s3-attach   │     │ virt-runner  │     │    dbops     │     │ results-disp │
 │              │     │              │     │              │     │              │
-│ Model pool   │────▶│ Provision,   │────▶│ Submit       │────▶│ Public       │
-│ management   │     │ benchmark,   │     │ results to   │     │ leaderboard  │
+│ Private/gated│────▶│ Provision,   │────▶│ Submit       │────▶│ Public       │
+│ models only  │     │ benchmark,   │     │ results to   │     │ leaderboard  │
 │ (Wasabi S3)  │     │ teardown     │     │ Supabase     │     │ (read-only)  │
 └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
 ## Components
 
-### `s3-attach` — Model Pool Manager
+### `s3-attach` — Private Model Pool Manager
 
-Maintains a shared model pool on Wasabi S3 so that benchmark runners pull models from a single source rather than downloading from HuggingFace/Meta on every run.
+Manages models on Wasabi S3 that **cannot be pulled directly from public sources** — Meta's original Llama weights (license-gated), custom fine-tunes, or access-restricted models.
+
+Public models on HuggingFace (community GGUF quants, GPTQ repos, etc.) are **not** mirrored to S3. Benchmark runners pull those directly from HuggingFace Hub at runtime.
+
+**What goes on S3 vs HuggingFace:**
+| Storage | When to use | Examples |
+|---------|-------------|----------|
+| `s3` | Private, gated, or Meta-distributed weights | Meta Llama full weights, custom fine-tunes |
+| `huggingface` | Public repos, freely downloadable | bartowski GGUF quants, community GPTQ repos, Mistral weights |
+
+Each format in `models.toml` specifies its `storage` — `s3-attach sync` only processes formats marked `storage = "s3"`.
 
 **Responsibilities:**
-- Download models from HuggingFace Hub or Meta's LLaMA distribution
+- Download gated/private models from Meta's LLaMA distribution or HuggingFace (with auth)
 - Upload to a Wasabi S3 bucket in a structured layout
 - Clean up local downloads after upload
 - Track which models/formats are available via a manifest
+
+**Bucket layout** (only private/gated models):
+```
+s3://gpuscale-models/
+├── meta-llama/
+│   └── Llama-3.1-8B-Instruct/
+│       └── full/                # Meta-distributed FP16/BF16 weights
+├── (custom models would go here)
+└── manifest.json                # Index of S3-hosted models + checksums
+```
 
 **Supported formats** (expandable):
 | Format | Description |
@@ -35,24 +60,7 @@ Maintains a shared model pool on Wasabi S3 so that benchmark runners pull models
 | GGUF | llama.cpp quantized formats (Q4_K_M, Q5_K_M, Q8_0, etc.) |
 | GPTQ | GPU-optimized post-training quantization |
 
-**Bucket layout:**
-```
-s3://gpuscale-models/
-├── meta-llama/
-│   └── Llama-3.1-8B-Instruct/
-│       ├── full/            # FP16/BF16
-│       ├── gguf/
-│       │   ├── Q4_K_M.gguf
-│       │   └── Q8_0.gguf
-│       └── gptq/
-│           └── 4bit-128g/
-├── mistralai/
-│   └── Mistral-7B-Instruct-v0.3/
-│       └── ...
-└── manifest.json            # Index of all available models + checksums
-```
-
-**Supported models** are defined in a config file (`s3-attach/models.toml` or similar). Adding a new model to the benchmark suite means adding it to this config.
+**Supported models** are defined in `s3-attach/models.toml`. Each format specifies `storage = "s3"` or `storage = "huggingface"` to control where it lives.
 
 ### `virt-runner` — Benchmark Orchestrator
 
