@@ -10,7 +10,7 @@
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake git build-essential \
+    cmake git build-essential libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin to a specific release for reproducibility
