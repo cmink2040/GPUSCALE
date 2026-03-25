@@ -6,6 +6,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+
+_env_path = Path(__file__).resolve()
+for _parent in _env_path.parents:
+    _candidate = _parent / ".env"
+    if _candidate.exists():
+        load_dotenv(_candidate)
+        break
+
 import click
 from rich.console import Console
 from rich.table import Table

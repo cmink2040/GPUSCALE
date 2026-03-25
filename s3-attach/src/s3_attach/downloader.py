@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
-import subprocess
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -15,25 +15,35 @@ log = logging.getLogger(__name__)
 
 DEFAULT_DOWNLOAD_DIR = Path("downloads")
 
-# Default location where `llama model download` stores checkpoints.
-META_CHECKPOINTS_DIR = Path.home() / ".llama" / "checkpoints"
-
 
 def download_model(
     model: ModelSpec,
     fmt: FormatSpec,
     download_dir: Path = DEFAULT_DOWNLOAD_DIR,
+    meta_url: str | None = None,
 ) -> Path:
     """Download a model in the specified format.
 
     Routes to Meta's official distribution or HuggingFace Hub based on
-    the model's source config. GGUF and GPTQ formats always use HuggingFace
-    since Meta only distributes full weights.
+    the model's source config.
+
+    Args:
+        meta_url: Meta signed download URL. Required for source="meta" models.
+                  Can also be set via META_LLAMA_URL env var.
 
     Returns the local directory path containing the downloaded artifacts.
     """
     if fmt.type == "full" and model.source == "meta":
-        return _download_meta_full(model, download_dir)
+        url = meta_url or os.environ.get("META_LLAMA_URL")
+        if not url:
+            raise RuntimeError(
+                f"Model '{model.repo_id}' requires a Meta signed URL.\n"
+                "Get one at https://llama.meta.com/ (accept the license, URL is emailed to you).\n"
+                "Then either:\n"
+                "  - Pass --meta-url <URL>\n"
+                "  - Set META_LLAMA_URL=<URL> in your .env"
+            )
+        return _download_meta_full(model, download_dir, url)
     elif fmt.type == "full":
         return _download_hf_full(model, download_dir)
     elif fmt.type == "gguf":
@@ -45,21 +55,22 @@ def download_model(
 
 
 # ---------------------------------------------------------------------------
-# Meta official distribution (full weights only)
+# Meta official distribution (via llama_models Python API)
 # ---------------------------------------------------------------------------
 
 
-def _download_meta_full(model: ModelSpec, download_dir: Path) -> Path:
-    """Download full weights via Meta's llama-models CLI.
+def _download_meta_full(model: ModelSpec, download_dir: Path, signed_url: str) -> Path:
+    """Download full weights from Meta using the llama_models library.
 
-    Uses `llama model download --source meta --model-id <id>`.
-    The CLI downloads to ~/.llama/checkpoints/<model-id>/, then we copy
-    the files into our structured download directory.
-
-    Note: First-time use requires accepting Meta's license at
-    https://llama.meta.com/ — you'll receive a signed URL via email
-    that the CLI will prompt for.
+    Uses the llama_models Python API directly to resolve the model's file
+    manifest, then calls its parallel downloader. This is the same logic
+    the `llama-model download` CLI uses internally.
     """
+    import asyncio
+
+    from llama_models.sku_list import llama_meta_net_info, resolve_model
+    from llama_models.cli.download import DownloadTask, ParallelDownloader
+
     meta_id = model.meta_model_id
     if not meta_id:
         raise ValueError(
@@ -67,82 +78,58 @@ def _download_meta_full(model: ModelSpec, download_dir: Path) -> Path:
             "Check models.toml."
         )
 
-    log.info("Downloading full weights for %s via Meta CLI (model-id: %s)", model.repo_id, meta_id)
-
-    # Run the llama CLI
-    cmd = ["llama", "model", "download", "--source", "meta", "--model-id", meta_id]
-    try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        log.debug("llama model download stdout: %s", result.stdout)
-    except FileNotFoundError:
+    # Resolve the model and get its download manifest
+    resolved = resolve_model(meta_id)
+    if resolved is None:
+        # Try with different casing conventions
+        for variant in [meta_id, meta_id.title(), meta_id.replace("-", ".")]:
+            resolved = resolve_model(variant)
+            if resolved is not None:
+                break
+    if resolved is None:
         raise RuntimeError(
-            "The 'llama' CLI was not found. Install it with: pip install llama-models"
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"Meta download failed for {meta_id}.\n"
-            f"stdout: {e.stdout}\n"
-            f"stderr: {e.stderr}\n"
-            "If this is your first download, visit https://llama.meta.com/ to accept "
-            "the license and obtain a signed URL."
+            f"Model '{meta_id}' not found in llama_models registry. "
+            "Run `uv run llama-model list --show-all` to see valid IDs."
         )
 
-    # Meta downloads to ~/.llama/checkpoints/<model-id>/
-    # The model-id in the directory may differ in casing from the CLI arg.
-    # Search for a matching directory.
-    meta_dir = _find_meta_checkpoint(meta_id)
-    if not meta_dir or not meta_dir.exists():
-        raise RuntimeError(
-            f"Download appeared to succeed but checkpoint directory not found. "
-            f"Expected under {META_CHECKPOINTS_DIR}/ for model-id '{meta_id}'. "
-            f"Check `llama model list` for the correct model ID."
-        )
+    info = llama_meta_net_info(resolved)
+    log.info(
+        "Downloading %s from Meta: folder=%s, files=%s",
+        model.repo_id,
+        info.folder,
+        info.files,
+    )
 
-    # Copy into our structured download directory
+    # Download into our structured directory
     local_dir = download_dir / model.org / model.name / "full"
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("Copying Meta checkpoint from %s to %s", meta_dir, local_dir)
-    for src_file in meta_dir.iterdir():
-        if src_file.is_file():
-            dest = local_dir / src_file.name
-            shutil.copy2(src_file, dest)
-            log.debug("Copied %s", src_file.name)
+    # Build download tasks — same URL construction as the official CLI:
+    #   url = meta_url.replace("*", f"{info.folder}/{filename}")
+    tasks = []
+    for filename in info.files:
+        output_file = str(local_dir / filename)
+        if Path(output_file).exists():
+            log.info("Already exists, skipping: %s", filename)
+            continue
+        url = signed_url.replace("*", f"{info.folder}/{filename}")
+        total_size = info.pth_size if "consolidated" in filename else 0
+        tasks.append(DownloadTask(
+            url=url,
+            output_file=output_file,
+            total_size=total_size,
+            max_retries=3,
+        ))
 
-    log.info("Meta full-weight download complete: %s", local_dir)
+    if tasks:
+        downloader = ParallelDownloader(max_concurrent_downloads=3)
+        asyncio.run(downloader.download_all(tasks))
+    else:
+        log.info("All files already downloaded.")
+
+    file_count = sum(1 for f in local_dir.iterdir() if f.is_file())
+    log.info("Meta download complete: %s (%d files in %s)", model.repo_id, file_count, local_dir)
     return local_dir
-
-
-def _find_meta_checkpoint(meta_model_id: str) -> Path | None:
-    """Find the checkpoint directory for a given Meta model ID.
-
-    The directory name under ~/.llama/checkpoints/ may use different casing
-    or formatting than the CLI model-id, so we do a case-insensitive search.
-    """
-    if not META_CHECKPOINTS_DIR.exists():
-        return None
-
-    # Normalize for comparison: lowercase, strip hyphens/underscores/dots
-    def normalize(s: str) -> str:
-        return s.lower().replace("-", "").replace("_", "").replace(".", "")
-
-    target = normalize(meta_model_id)
-
-    for entry in META_CHECKPOINTS_DIR.iterdir():
-        if entry.is_dir() and normalize(entry.name) == target:
-            return entry
-
-    # Fallback: partial match
-    for entry in META_CHECKPOINTS_DIR.iterdir():
-        if entry.is_dir() and target in normalize(entry.name):
-            return entry
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -168,18 +155,13 @@ def _download_hf_full(model: ModelSpec, download_dir: Path) -> Path:
 
 
 def _download_hf_gguf(model: ModelSpec, fmt: FormatSpec, download_dir: Path) -> Path:
-    """Download GGUF quantized files from HuggingFace Hub.
-
-    GGUF files are always sourced from HuggingFace (typically community quant repos)
-    regardless of the model's primary source, since Meta does not distribute GGUF.
-    """
+    """Download GGUF quantized files from HuggingFace Hub."""
     local_dir = download_dir / model.org / model.name / "gguf"
     local_dir.mkdir(parents=True, exist_ok=True)
 
     source_repo = fmt.gguf_repo_id or model.repo_id
 
     for quant in fmt.quants:
-        # Convention: the GGUF file is named <model-name>-<quant>.gguf or just <quant>.gguf
         filename = f"{quant}.gguf"
         alt_filename = f"{model.name}-{quant}.gguf"
         alt_filename_2 = f"{model.name.lower()}-{quant.lower()}.gguf"
@@ -193,7 +175,6 @@ def _download_hf_gguf(model: ModelSpec, fmt: FormatSpec, download_dir: Path) -> 
                     filename=candidate,
                     local_dir=str(local_dir),
                 )
-                # Rename to the canonical name we use in the bucket (e.g. Q4_K_M.gguf)
                 dest = local_dir / f"{quant}.gguf"
                 downloaded_path = Path(path)
                 if downloaded_path != dest:
@@ -202,9 +183,7 @@ def _download_hf_gguf(model: ModelSpec, fmt: FormatSpec, download_dir: Path) -> 
                 downloaded = True
                 break
             except Exception:
-                log.debug(
-                    "File %s not found in %s, trying next pattern", candidate, source_repo
-                )
+                log.debug("File %s not found in %s, trying next pattern", candidate, source_repo)
                 continue
 
         if not downloaded:
@@ -220,11 +199,7 @@ def _download_hf_gguf(model: ModelSpec, fmt: FormatSpec, download_dir: Path) -> 
 
 
 def _download_hf_gptq(model: ModelSpec, fmt: FormatSpec, download_dir: Path) -> Path:
-    """Download GPTQ quantized weights from HuggingFace Hub.
-
-    GPTQ files are always sourced from HuggingFace regardless of the model's
-    primary source, since Meta does not distribute GPTQ.
-    """
+    """Download GPTQ quantized weights from HuggingFace Hub."""
     local_dir = download_dir / model.org / model.name / "gptq" / fmt.variant
     local_dir.mkdir(parents=True, exist_ok=True)
 

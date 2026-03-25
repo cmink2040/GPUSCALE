@@ -6,6 +6,16 @@ import logging
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Walk up to find the root .env file
+_env_path = Path(__file__).resolve()
+for _parent in _env_path.parents:
+    _candidate = _parent / ".env"
+    if _candidate.exists():
+        load_dotenv(_candidate)
+        break
+
 import click
 from rich.console import Console
 from rich.logging import RichHandler
@@ -110,6 +120,12 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     default=None,
     help="Only sync a specific model (match by repo_id substring, e.g. 'Llama-3.1-8B').",
 )
+@click.option(
+    "--meta-url",
+    type=str,
+    default=None,
+    help="Meta signed download URL for Llama models (or set META_LLAMA_URL env var).",
+)
 def sync(
     config_path: Path | None,
     download_dir: Path,
@@ -117,6 +133,7 @@ def sync(
     skip_upload: bool,
     keep_local: bool,
     model_filter: str | None,
+    meta_url: str | None,
 ) -> None:
     """Download models from HuggingFace and upload to Wasabi S3.
 
@@ -161,14 +178,18 @@ def sync(
             elif fmt.type == "gptq":
                 fmt_label = f"gptq/{fmt.variant}"
 
-            console.print(f"  Format: [green]{fmt_label}[/green]")
+            if not fmt.is_s3:
+                console.print(f"  Format: [dim]{fmt_label}[/dim] [dim](huggingface — skipped, pulled direct by runner)[/dim]")
+                continue
+
+            console.print(f"  Format: [green]{fmt_label}[/green] [cyan](s3)[/cyan]")
 
             local_path: Path | None = None
 
             # --- Download ---
             if not skip_download:
                 try:
-                    local_path = download_model(model, fmt, download_dir)
+                    local_path = download_model(model, fmt, download_dir, meta_url=meta_url)
                     console.print(f"  Downloaded to: {local_path}")
                 except NotImplementedError as e:
                     console.print(f"  [yellow]Skipped (not implemented):[/yellow] {e}")

@@ -22,6 +22,7 @@ class FormatSpec:
     """A single format entry for a model."""
 
     type: str  # "full", "gguf", or "gptq"
+    storage: str = "huggingface"  # "huggingface" (pull direct) or "s3" (pull from Wasabi)
     quants: list[str] = field(default_factory=list)
     variant: str = ""
     gguf_repo_id: str = ""
@@ -31,10 +32,18 @@ class FormatSpec:
         valid_types = {"full", "gguf", "gptq"}
         if self.type not in valid_types:
             raise ValueError(f"Invalid format type '{self.type}'. Must be one of {valid_types}")
+        valid_storage = {"huggingface", "s3"}
+        if self.storage not in valid_storage:
+            raise ValueError(f"Invalid storage '{self.storage}'. Must be one of {valid_storage}")
         if self.type == "gguf" and not self.quants:
             raise ValueError("GGUF format requires at least one entry in 'quants'")
         if self.type == "gptq" and not self.variant:
             raise ValueError("GPTQ format requires a 'variant' (e.g. '4bit-128g')")
+
+    @property
+    def is_s3(self) -> bool:
+        """Whether this format is stored on S3 (private/gated/meta)."""
+        return self.storage == "s3"
 
 
 @dataclass(frozen=True)
@@ -112,6 +121,7 @@ def load_config(path: Path | None = None) -> list[ModelSpec]:
             formats.append(
                 FormatSpec(
                     type=fmt_type,
+                    storage=fmt.get("storage", "huggingface"),
                     quants=fmt.get("quants", []),
                     variant=fmt.get("variant", ""),
                     gguf_repo_id=fmt.get("gguf_repo_id", ""),
