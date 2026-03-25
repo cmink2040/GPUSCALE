@@ -22,6 +22,8 @@ WORKDIR /llama.cpp
 RUN cmake -B build \
     -DGGML_CUDA=ON \
     -DCMAKE_CUDA_ARCHITECTURES="60;70;75;80;86;89;90" \
+    -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
     && cmake --build build --config Release -j$(nproc)
 
 # ---------------------------------------------------------------------------
