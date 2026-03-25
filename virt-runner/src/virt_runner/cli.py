@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import json
-import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
+
+from dotenv import load_dotenv
+
+# Walk up from this file to find the monorepo root .env
+_env_path = Path(__file__).resolve()
+for _parent in _env_path.parents:
+    _candidate = _parent / ".env"
+    if _candidate.exists():
+        load_dotenv(_candidate)
+        break
 
 import typer
 from rich.console import Console
@@ -14,7 +24,7 @@ from rich.table import Table
 from virt_runner.benchmark import run_benchmark
 from virt_runner.config import JobConfig
 from virt_runner.host_info import collect_host_metadata, detect_local_gpus
-from virt_runner.models import InferenceEngine, Provider
+from virt_runner.models import BenchmarkResult, InferenceEngine, Provider
 from virt_runner.providers.base import ProvisionedInstance
 from virt_runner.providers.local import LocalProvider
 from virt_runner.providers.runpod import RunPodProvider
@@ -42,6 +52,132 @@ def _get_provider(config: JobConfig):
             raise typer.BadParameter(f"Unknown provider: {config.provider}")
 
 
+def _build_dbops_payload(result: BenchmarkResult, config: JobConfig) -> dict:
+    """Convert a BenchmarkResult into a dict matching dbops BenchmarkResultCreate schema."""
+    agg = result.aggregate
+
+    # Map provider names to what the DB constraint expects
+    provider_map = {
+        "local": "local",
+        "vast": "vast.ai",
+        "runpod": "runpod",
+    }
+    db_provider = provider_map.get(result.provider.value, result.provider.value)
+
+    # Derive quantization label
+    quant = "FP16"
+    if config.gguf_quant:
+        quant = config.gguf_quant
+    elif config.model_format:
+        fmt = config.model_format.lower()
+        if fmt == "gptq":
+            quant = "GPTQ-4bit"
+        elif fmt == "gguf":
+            quant = config.gguf_quant or "GGUF"
+        elif fmt == "full":
+            quant = "FP16"
+
+    # GPU VRAM in GB (from GPUInfo or offer data)
+    gpu_vram_gb = 0.0
+    if result.gpus:
+        gpu_vram_gb = max(g.memory_total_mib for g in result.gpus) / 1024.0
+    if gpu_vram_gb == 0 and result.extra.get("gpu_vram_gb"):
+        gpu_vram_gb = float(result.extra["gpu_vram_gb"])
+    if gpu_vram_gb == 0:
+        gpu_vram_gb = 24.0  # fallback for common GPUs
+
+    payload = {
+        "gpu_name": result.gpu_name or "unknown",
+        "gpu_vram_gb": round(gpu_vram_gb, 1),
+        "gpu_count": result.gpu_count,
+        "provider": db_provider,
+        "engine": result.engine.value,
+        "model_name": result.model,
+        "quantization": quant,
+        "workload_version": result.workload.workload_version if result.workload else "1.0",
+        "workload_config": result.workload.model_dump() if result.workload else None,
+        "tokens_per_sec": max(agg.tokens_per_sec_mean, 0.01),  # DB requires > 0
+        "time_to_first_token_ms": max(agg.ttft_mean_ms, 0.0),
+        "prompt_eval_tokens_per_sec": agg.prompt_eval_rate_mean or None,
+        "peak_vram_mb": agg.peak_vram_mib or None,
+        "avg_power_draw_w": agg.power_draw_avg_w or None,
+        "peak_power_draw_w": agg.power_draw_peak_w or None,
+        "avg_gpu_util_pct": agg.gpu_utilization_pct_mean or None,
+        "avg_gpu_temp_c": agg.gpu_temperature_c_max or None,
+        "total_wall_time_s": agg.wall_time_total_s or None,
+        "engine_version": None,
+        "host_os": f"{result.host.os} {result.host.distro}".strip() or None,
+        "host_kernel": result.host.kernel_version or None,
+        "host_driver_version": result.host.gpu_driver_version or None,
+        "container_image": config.bench_image,
+        "container_driver_version": None,
+        "raw_output": {
+            "run_id": result.run_id,
+            "iterations": [m.model_dump() for m in result.iterations],
+            "errors": result.errors,
+        },
+    }
+    return payload
+
+
+def _submit_to_db(payload: dict) -> None:
+    """Submit benchmark result to the database via dbops."""
+    try:
+        from dbops.db import get_session, insert_result
+        from dbops.models import BenchmarkResultCreate
+    except ImportError:
+        console.print(
+            "[red]Cannot import dbops. Install it or ensure it is on the Python path.[/red]\n"
+            "[dim]Try: pip install -e ../dbops  or  uv pip install -e ../dbops[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Validate through Pydantic
+    try:
+        validated = BenchmarkResultCreate(**payload)
+    except Exception as exc:
+        console.print(f"[red]Validation error: {exc}[/red]")
+        console.print(f"[dim]Payload: {json.dumps(payload, indent=2, default=str)}[/dim]")
+        raise typer.Exit(1)
+
+    # Insert into DB
+    try:
+        with get_session() as session:
+            orm_obj = validated.to_orm()
+            inserted = insert_result(session, orm_obj)
+            console.print(
+                f"[green]Result submitted to database. ID: {inserted.id}[/green]"
+            )
+    except Exception as exc:
+        console.print(f"[red]Database error: {exc}[/red]")
+        raise typer.Exit(1)
+
+
+def _print_summary(result: BenchmarkResult) -> None:
+    """Print a rich summary table of the benchmark result."""
+    agg = result.aggregate
+    table = Table(title="Benchmark Summary")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Provider", result.provider.value)
+    table.add_row("Engine", result.engine.value)
+    table.add_row("Model", result.model)
+    table.add_row("GPU", f"{result.gpu_name} x{result.gpu_count}")
+    table.add_row("", "")
+    table.add_row("Tokens/sec (mean)", f"{agg.tokens_per_sec_mean:.2f}")
+    table.add_row("Tokens/sec (std)", f"{agg.tokens_per_sec_std:.2f}")
+    table.add_row("TTFT (mean)", f"{agg.ttft_mean_ms:.2f} ms")
+    table.add_row("Prompt eval rate", f"{agg.prompt_eval_rate_mean:.2f} tok/s")
+    table.add_row("", "")
+    table.add_row("Peak VRAM", f"{agg.peak_vram_mib:.0f} MiB")
+    table.add_row("Avg Power", f"{agg.power_draw_avg_w:.1f} W")
+    table.add_row("Peak Power", f"{agg.power_draw_peak_w:.1f} W")
+    table.add_row("GPU Util (mean)", f"{agg.gpu_utilization_pct_mean:.1f}%")
+    table.add_row("GPU Temp (max)", f"{agg.gpu_temperature_c_max:.1f} C")
+    table.add_row("Total Wall Time", f"{agg.wall_time_total_s:.2f} s")
+    console.print(table)
+
+
 # ---------------------------------------------------------------------------
 # run command
 # ---------------------------------------------------------------------------
@@ -49,24 +185,51 @@ def _get_provider(config: JobConfig):
 
 @app.command()
 def run(
-    model: Annotated[str, typer.Option("--model", "-m", help="Model identifier, e.g. 'llama-3-8b-q4'")],
-    provider: Annotated[Provider, typer.Option("--provider", "-p", help="Provider: local, vast, runpod")] = Provider.LOCAL,
-    engine: Annotated[InferenceEngine, typer.Option("--engine", "-e", help="Inference engine: llama.cpp, vllm")] = InferenceEngine.LLAMA_CPP,
-    gpu_type: Annotated[str, typer.Option("--gpu-type", help="GPU type for cloud providers")] = "",
-    gpu_count: Annotated[int, typer.Option("--gpu-count", help="Number of GPUs")] = 1,
-    workload_file: Annotated[Optional[Path], typer.Option("--workload", "-w", help="Path to workload JSON")] = None,
-    bench_image: Annotated[str, typer.Option("--image", help="Docker benchmark image")] = "gpuscale-bench:latest",
-    ssh_key: Annotated[str, typer.Option("--ssh-key", help="Path to SSH private key for cloud")] = "",
-    output_file: Annotated[Optional[Path], typer.Option("--output", "-o", help="Write results JSON to file")] = None,
-    timeout: Annotated[int, typer.Option("--timeout", help="Benchmark timeout in seconds")] = 1800,
+    model: Annotated[str, typer.Option(
+        "--model", "-m", help="Model identifier, e.g. 'meta-llama/Llama-3.1-8B-Instruct'"
+    )],
+    engine: Annotated[InferenceEngine, typer.Option(
+        "--engine", "-e", help="Inference engine: llama.cpp, vllm"
+    )] = InferenceEngine.LLAMA_CPP,
+    provider: Annotated[Provider, typer.Option(
+        "--provider", "-p", help="Provider: local, vast, runpod"
+    )] = Provider.LOCAL,
+    gpu_type: Annotated[str, typer.Option(
+        "--gpu", help="GPU type for cloud providers, e.g. 'RTX_4090'"
+    )] = "",
+    gpu_count: Annotated[int, typer.Option(
+        "--gpu-count", help="Number of GPUs"
+    )] = 1,
+    model_format: Annotated[str, typer.Option(
+        "--model-format", help="Model format: full, gguf, gptq"
+    )] = "",
+    gguf_quant: Annotated[str, typer.Option(
+        "--gguf-quant", help="GGUF quantization, e.g. Q4_K_M"
+    )] = "",
+    workload_file: Annotated[Optional[Path], typer.Option(
+        "--workload", "-w", help="Path to workload JSON"
+    )] = None,
+    bench_image: Annotated[str, typer.Option(
+        "--image", help="Docker benchmark image"
+    )] = "ghcr.io/cmink2040/gpuscale-bench:latest",
+    output_file: Annotated[Optional[Path], typer.Option(
+        "--output", "-o", help="Write results JSON to file"
+    )] = None,
+    timeout: Annotated[int, typer.Option(
+        "--timeout", help="Benchmark timeout in seconds"
+    )] = 1800,
+    submit: Annotated[bool, typer.Option(
+        "--submit", help="Submit results to the database via dbops"
+    )] = False,
 ) -> None:
     """Run a GPU benchmark job."""
     config = JobConfig(
         provider=provider,
         engine=engine,
         model=model,
+        model_format=model_format,
+        gguf_quant=gguf_quant,
         bench_image=bench_image,
-        ssh_key_path=ssh_key,
         timeout_s=timeout,
     )
     config.provider_config.gpu_type = gpu_type
@@ -78,60 +241,63 @@ def run(
     instance: ProvisionedInstance | None = None
 
     try:
-        console.print(f"\n[bold]Provider:[/bold] {prov.get_name()}")
-        console.print(f"[bold]Engine:[/bold]   {engine.value}")
-        console.print(f"[bold]Model:[/bold]    {model}")
-        console.print(f"[bold]Image:[/bold]    {bench_image}\n")
+        console.print()
+        console.print(f"[bold]Provider:[/bold]     {prov.get_name()}")
+        console.print(f"[bold]Engine:[/bold]       {engine.value}")
+        console.print(f"[bold]Model:[/bold]        {model}")
+        if model_format:
+            console.print(f"[bold]Format:[/bold]       {model_format}")
+        if gguf_quant:
+            console.print(f"[bold]Quantization:[/bold] {gguf_quant}")
+        console.print(f"[bold]Image:[/bold]        {bench_image}")
+        console.print()
 
         # Provision
         instance = prov.provision()
         if instance.gpus:
-            console.print(f"[green]Detected {len(instance.gpus)} GPU(s):[/green]")
+            console.print(f"[green]GPU(s): {len(instance.gpus)}[/green]")
             for gpu in instance.gpus:
-                console.print(f"  [{gpu.index}] {gpu.name} ({gpu.memory_total_mib} MiB)")
-        elif not instance.is_local:
-            console.print("[yellow]GPU info will be collected during benchmark.[/yellow]")
-        else:
-            console.print("[red]No GPUs detected on local machine.[/red]")
+                vram = f" ({gpu.memory_total_mib} MiB)" if gpu.memory_total_mib else ""
+                console.print(f"  [{gpu.index}] {gpu.name}{vram}")
+        elif provider == Provider.LOCAL:
+            console.print(
+                "[yellow]No GPUs detected locally. The container needs --gpus all "
+                "and nvidia-container-toolkit installed.[/yellow]"
+            )
+
+        # Wait for instance / container to finish
+        if not prov.wait_ready(instance, timeout_s=timeout):
+            console.print("[red]Instance/container failed or timed out. Aborting.[/red]")
             raise typer.Exit(1)
 
-        # Wait for instance
-        if not prov.wait_ready(instance):
-            console.print("[red]Instance failed to become ready. Aborting.[/red]")
-            raise typer.Exit(1)
-
-        # Run benchmark
+        # Run benchmark (local) or parse logs (cloud)
         result = run_benchmark(config, instance, workload)
 
-        # Output results
-        result_json = result.model_dump_json(indent=2)
-        if output_file:
-            output_file.write_text(result_json)
-            console.print(f"\n[green]Results written to {output_file}[/green]")
-        else:
-            console.print("\n[bold]Results:[/bold]")
-            console.print(result_json)
+        # Always save the result JSON
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        default_output = Path(f"bench_result_{timestamp}.json")
+        out_path = output_file or default_output
 
-        # Summary table
-        agg = result.aggregate
-        table = Table(title="Benchmark Summary")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
-        table.add_row("Tokens/sec (mean)", f"{agg.tokens_per_sec_mean:.2f}")
-        table.add_row("Tokens/sec (std)", f"{agg.tokens_per_sec_std:.2f}")
-        table.add_row("TTFT (mean)", f"{agg.ttft_mean_ms:.2f} ms")
-        table.add_row("Peak VRAM", f"{agg.peak_vram_mib:.0f} MiB")
-        table.add_row("Avg Power", f"{agg.power_draw_avg_w:.1f} W")
-        table.add_row("Peak Power", f"{agg.power_draw_peak_w:.1f} W")
-        table.add_row("GPU Util (mean)", f"{agg.gpu_utilization_pct_mean:.1f}%")
-        table.add_row("GPU Temp (max)", f"{agg.gpu_temperature_c_max:.1f} C")
-        table.add_row("Total Wall Time", f"{agg.wall_time_total_s:.2f} s")
-        console.print(table)
+        result_dict = result.model_dump(mode="json")
+        result_json = json.dumps(result_dict, indent=2, default=str)
+        out_path.write_text(result_json)
+        console.print(f"\n[green]Results written to {out_path}[/green]")
 
+        # Print summary
+        console.print()
+        _print_summary(result)
+
+        # Print errors if any
         if result.errors:
             console.print(f"\n[red]Errors ({len(result.errors)}):[/red]")
             for err in result.errors:
                 console.print(f"  - {err}")
+
+        # Submit to DB if requested
+        if submit:
+            console.print("\n[bold]Submitting to database...[/bold]")
+            payload = _build_dbops_payload(result, config)
+            _submit_to_db(payload)
 
     finally:
         if instance is not None:

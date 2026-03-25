@@ -11,6 +11,15 @@ dependencies = [
     "docker>=7.1",
     "pydantic>=2.10",
     "httpx>=0.28",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv.sources]
+gpuscale-dbops = { path = "../dbops" }
+
+[project.optional-dependencies]
+db = [
+    "gpuscale-dbops",
 ]
 
 [project.scripts]

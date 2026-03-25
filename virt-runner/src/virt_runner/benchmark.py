@@ -1,15 +1,13 @@
-"""Orchestrate benchmark runs: pull container, execute workload, collect metrics."""
+"""Orchestrate benchmark runs: run container, parse combined output, collect metrics."""
 
 from __future__ import annotations
 
-import json
+import re
 import subprocess
 import time
 import uuid
 
-import paramiko
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from virt_runner.config import JobConfig
 from virt_runner.metrics import (
@@ -17,90 +15,39 @@ from virt_runner.metrics import (
     parse_llamacpp_output,
     parse_nvidia_smi_output,
     parse_vllm_output,
-    query_nvidia_smi,
 )
 from virt_runner.models import BenchmarkResult, InferenceEngine, WorkloadConfig
 from virt_runner.providers.base import ProvisionedInstance
 
 console = Console(stderr=True)
 
-
 # ---------------------------------------------------------------------------
-# SSH helpers
-# ---------------------------------------------------------------------------
-
-
-def _ssh_connect(instance: ProvisionedInstance) -> paramiko.SSHClient:
-    """Open an SSH connection to a provisioned instance."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kwargs: dict = {
-        "hostname": instance.host,
-        "port": instance.port,
-        "username": instance.ssh_user,
-        "timeout": 30,
-    }
-    if instance.ssh_key_path:
-        kwargs["key_filename"] = instance.ssh_key_path
-    client.connect(**kwargs)
-    return client
-
-
-def _ssh_exec(client: paramiko.SSHClient, cmd: str, timeout: int = 600) -> str:
-    """Execute a command over SSH and return combined stdout+stderr."""
-    _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-    out = stdout.read().decode()
-    err = stderr.read().decode()
-    return out + err
-
-
-# ---------------------------------------------------------------------------
-# Docker helpers
+# Output parsing: split engine output from GPU metrics block
 # ---------------------------------------------------------------------------
 
-
-def _build_docker_run_cmd(
-    config: JobConfig,
-    workload: WorkloadConfig,
-    s3_env: dict[str, str],
-) -> str:
-    """Build the 'docker run' command string for the benchmark container."""
-    env_flags: list[str] = []
-    for k, v in s3_env.items():
-        env_flags.append(f"-e {k}={v}")
-
-    workload_json = json.dumps(workload.model_dump(), separators=(",", ":"))
-    env_flags.append(f"-e WORKLOAD_CONFIG='{workload_json}'")
-    env_flags.append(f"-e MODEL={config.model}")
-    env_flags.append(f"-e ENGINE={config.engine.value}")
-
-    env_str = " ".join(env_flags)
-    return (
-        f"docker run --rm --gpus all {env_str} "
-        f"{config.bench_image}"
-    )
+GPU_METRICS_START = "=== GPU_METRICS_START ==="
+GPU_METRICS_END = "=== GPU_METRICS_END ==="
 
 
-def _get_s3_env(config: JobConfig) -> dict[str, str]:
-    """Build S3-related env vars for the container."""
-    s3 = config.s3
-    env: dict[str, str] = {}
-    if s3.endpoint:
-        env["S3_ENDPOINT"] = s3.endpoint
-    if s3.access_key:
-        env["AWS_ACCESS_KEY_ID"] = s3.access_key
-    if s3.secret_key:
-        env["AWS_SECRET_ACCESS_KEY"] = s3.secret_key
-    if s3.bucket:
-        env["S3_BUCKET"] = s3.bucket
-    if s3.model_key:
-        env["S3_MODEL_KEY"] = s3.model_key
-    return env
+def split_container_output(raw: str) -> tuple[str, str]:
+    """Split the combined container output into engine output and GPU metrics CSV.
 
+    The container prints engine output to stdout, then between
+    ``=== GPU_METRICS_START ===`` and ``=== GPU_METRICS_END ===``
+    markers emits nvidia-smi CSV data.
 
-# ---------------------------------------------------------------------------
-# Engine output parsing dispatch
-# ---------------------------------------------------------------------------
+    Returns (engine_output, gpu_metrics_csv).
+    """
+    start_idx = raw.find(GPU_METRICS_START)
+    end_idx = raw.find(GPU_METRICS_END)
+
+    if start_idx == -1 or end_idx == -1:
+        # No metrics markers found -- entire output is engine output
+        return raw, ""
+
+    engine_output = raw[:start_idx].rstrip()
+    gpu_csv = raw[start_idx + len(GPU_METRICS_START) : end_idx].strip()
+    return engine_output, gpu_csv
 
 
 def _parse_engine_output(engine: InferenceEngine, output: str):
@@ -110,85 +57,7 @@ def _parse_engine_output(engine: InferenceEngine, output: str):
     elif engine == InferenceEngine.VLLM:
         return parse_vllm_output(output)
     else:
-        return parse_llamacpp_output(output)  # fallback
-
-
-# ---------------------------------------------------------------------------
-# Remote benchmark (cloud providers)
-# ---------------------------------------------------------------------------
-
-
-def run_remote_benchmark(
-    config: JobConfig,
-    instance: ProvisionedInstance,
-    workload: WorkloadConfig,
-) -> BenchmarkResult:
-    """Run a benchmark on a remote instance via SSH."""
-    run_id = f"remote-{uuid.uuid4().hex[:12]}"
-    result = BenchmarkResult(
-        run_id=run_id,
-        provider=config.provider,
-        engine=config.engine,
-        model=config.model,
-        gpu_name=instance.gpus[0].name if instance.gpus else "",
-        gpu_count=len(instance.gpus) if instance.gpus else config.provider_config.gpu_count,
-        workload=workload,
-        host=instance.host_metadata,
-        gpus=instance.gpus,
-    )
-
-    ssh = _ssh_connect(instance)
-    try:
-        # Pull the benchmark container
-        console.print(f"[bold]Pulling benchmark image {config.bench_image}...[/bold]")
-        pull_output = _ssh_exec(ssh, f"docker pull {config.bench_image}", timeout=600)
-        console.print(f"[dim]{pull_output[:200]}[/dim]")
-
-        s3_env = _get_s3_env(config)
-        docker_cmd = _build_docker_run_cmd(config, workload, s3_env)
-        collector = MetricsCollector()
-
-        total_iterations = workload.warmup_iterations + workload.iterations
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Running benchmark...", total=total_iterations)
-
-            for i in range(total_iterations):
-                is_warmup = i < workload.warmup_iterations
-                label = f"warmup {i + 1}" if is_warmup else f"iteration {i + 1 - workload.warmup_iterations}"
-                progress.update(task, description=f"Running {label}...")
-
-                # Collect GPU snapshot before run
-                smi_raw = _ssh_exec(
-                    ssh,
-                    "nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,"
-                    "power.draw,temperature.gpu --format=csv,noheader,nounits",
-                    timeout=15,
-                )
-
-                # Run the benchmark container
-                output = _ssh_exec(ssh, docker_cmd, timeout=config.timeout_s)
-
-                # Parse results
-                engine_timings = _parse_engine_output(config.engine, output)
-                gpu_snapshots = parse_nvidia_smi_output(smi_raw)
-                collector.record_iteration(i, engine_timings, gpu_snapshots or None)
-
-                progress.advance(task)
-
-        result.iterations = collector.iteration_metrics
-        result.aggregate = collector.aggregate(warmup_iterations=workload.warmup_iterations)
-        result.raw_engine_output = output  # last iteration output
-    except Exception as exc:
-        result.errors.append(str(exc))
-        console.print(f"[red]Benchmark error: {exc}[/red]")
-    finally:
-        ssh.close()
-
-    return result
+        return parse_llamacpp_output(output)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +70,12 @@ def run_local_benchmark(
     instance: ProvisionedInstance,
     workload: WorkloadConfig,
 ) -> BenchmarkResult:
-    """Run a benchmark on the local machine using Docker."""
+    """Run the benchmark container locally with `docker run --gpus all`.
+
+    The container handles all iterations, warmup, model pulling, and metrics
+    collection internally. We capture its stdout (which contains engine timing
+    lines interleaved with iteration markers, followed by the GPU_METRICS block).
+    """
     run_id = f"local-{uuid.uuid4().hex[:12]}"
     result = BenchmarkResult(
         run_id=run_id,
@@ -215,51 +89,146 @@ def run_local_benchmark(
         gpus=instance.gpus,
     )
 
-    s3_env = _get_s3_env(config)
-    docker_cmd = _build_docker_run_cmd(config, workload, s3_env)
+    env_vars = config.build_container_env()
+
+    # Build docker run command
+    cmd_parts = ["docker", "run", "--rm", "--gpus", "all"]
+    for k, v in env_vars.items():
+        cmd_parts.extend(["-e", f"{k}={v}"])
+    cmd_parts.append(config.bench_image)
+
+    console.print(f"[bold]Running benchmark container locally...[/bold]")
+    console.print(f"[dim]Image: {config.bench_image}[/dim]")
+
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd_parts,
+            capture_output=True,
+            text=True,
+            timeout=config.timeout_s,
+        )
+        raw_output = proc.stdout + proc.stderr
+        elapsed = time.time() - t0
+
+        if proc.returncode != 0:
+            result.errors.append(f"Container exited with code {proc.returncode}")
+            console.print(f"[red]Container exited with code {proc.returncode}[/red]")
+            # Still try to parse whatever output we got
+
+    except subprocess.TimeoutExpired:
+        result.errors.append(f"Container timed out after {config.timeout_s}s")
+        console.print(f"[red]Container timed out after {config.timeout_s}s[/red]")
+        return result
+
+    # Parse the combined output
+    result.raw_engine_output = raw_output
+    engine_output, gpu_csv = split_container_output(raw_output)
+
+    # Parse engine timings -- the container runs multiple iterations, each
+    # producing its own timing output.  We extract per-iteration results.
+    iteration_outputs = _split_iterations(engine_output, workload)
+    gpu_snapshots = parse_nvidia_smi_output(gpu_csv) if gpu_csv else []
+
     collector = MetricsCollector()
+    total_iters = workload.warmup_iterations + workload.iterations
 
-    total_iterations = workload.warmup_iterations + workload.iterations
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Running benchmark...", total=total_iterations)
+    for i, iter_output in enumerate(iteration_outputs):
+        engine_timings = _parse_engine_output(config.engine, iter_output)
+        # Distribute GPU snapshots across iterations (they are aggregated)
+        collector.record_iteration(i, engine_timings, gpu_snapshots or None)
 
-        for i in range(total_iterations):
-            is_warmup = i < workload.warmup_iterations
-            label = f"warmup {i + 1}" if is_warmup else f"iteration {i + 1 - workload.warmup_iterations}"
-            progress.update(task, description=f"Running {label}...")
-
-            # Collect GPU snapshot
-            gpu_snapshots = query_nvidia_smi()
-
-            # Run the benchmark container locally
-            try:
-                proc = subprocess.run(
-                    docker_cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=config.timeout_s,
-                )
-                output = proc.stdout + proc.stderr
-            except subprocess.TimeoutExpired:
-                result.errors.append(f"Iteration {i} timed out after {config.timeout_s}s")
-                output = ""
-
-            # Parse results
-            engine_timings = _parse_engine_output(config.engine, output)
-            collector.record_iteration(i, engine_timings, gpu_snapshots or None)
-
-            progress.advance(task)
+    # If we got no per-iteration splits, try to parse the whole engine output
+    if not iteration_outputs:
+        engine_timings = _parse_engine_output(config.engine, engine_output)
+        collector.record_iteration(0, engine_timings, gpu_snapshots or None)
 
     result.iterations = collector.iteration_metrics
     result.aggregate = collector.aggregate(warmup_iterations=workload.warmup_iterations)
-    result.raw_engine_output = output  # last iteration output
+
+    console.print(f"[green]Benchmark completed in {elapsed:.1f}s[/green]")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Cloud benchmark (Vast.ai / RunPod log-based)
+# ---------------------------------------------------------------------------
+
+
+def run_cloud_benchmark(
+    config: JobConfig,
+    instance: ProvisionedInstance,
+    workload: WorkloadConfig,
+    logs: str,
+) -> BenchmarkResult:
+    """Parse benchmark results from cloud container logs.
+
+    For cloud providers, the container is launched with the bench image and
+    env vars directly.  The provider polls until the container exits and
+    returns the full log output.  This function parses that output.
+    """
+    run_id = f"cloud-{uuid.uuid4().hex[:12]}"
+    result = BenchmarkResult(
+        run_id=run_id,
+        provider=config.provider,
+        engine=config.engine,
+        model=config.model,
+        gpu_name=instance.gpus[0].name if instance.gpus else (
+            instance.extra.get("gpu_name", "unknown")
+        ),
+        gpu_count=instance.extra.get("gpu_count", config.provider_config.gpu_count),
+        workload=workload,
+        host=instance.host_metadata,
+        gpus=instance.gpus,
+    )
+
+    result.raw_engine_output = logs
+    engine_output, gpu_csv = split_container_output(logs)
+
+    iteration_outputs = _split_iterations(engine_output, workload)
+    gpu_snapshots = parse_nvidia_smi_output(gpu_csv) if gpu_csv else []
+
+    collector = MetricsCollector()
+
+    for i, iter_output in enumerate(iteration_outputs):
+        engine_timings = _parse_engine_output(config.engine, iter_output)
+        collector.record_iteration(i, engine_timings, gpu_snapshots or None)
+
+    if not iteration_outputs:
+        engine_timings = _parse_engine_output(config.engine, engine_output)
+        collector.record_iteration(0, engine_timings, gpu_snapshots or None)
+
+    result.iterations = collector.iteration_metrics
+    result.aggregate = collector.aggregate(warmup_iterations=workload.warmup_iterations)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Iteration splitting
+# ---------------------------------------------------------------------------
+
+
+def _split_iterations(engine_output: str, workload: WorkloadConfig) -> list[str]:
+    """Split engine output into per-iteration chunks.
+
+    The bench container prints markers like:
+      ``--- Warmup iteration 1/1 ---``
+      ``--- Iteration 1/5 ---``
+
+    We split on those markers and return one string per iteration.
+    """
+    # Match both warmup and real iteration markers from entrypoint.sh
+    pattern = r"---\s+(?:Warmup iteration|Iteration)\s+\d+/\d+\s+---"
+    parts = re.split(pattern, engine_output)
+
+    # The first element is anything before the first marker (container boot logs)
+    # Skip it; the rest are iteration outputs
+    if len(parts) > 1:
+        return [p.strip() for p in parts[1:] if p.strip()]
+
+    # No markers found -- return the whole thing as a single "iteration"
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +241,19 @@ def run_benchmark(
     instance: ProvisionedInstance,
     workload: WorkloadConfig,
 ) -> BenchmarkResult:
-    """Run the benchmark, dispatching to local or remote as appropriate."""
+    """Run the benchmark, dispatching to local or cloud as appropriate.
+
+    For local: runs docker directly and captures output.
+    For cloud: the provider has already launched the container and collected
+    logs -- they are stored in instance.extra["logs"].
+    """
     if instance.is_local:
         return run_local_benchmark(config, instance, workload)
     else:
-        return run_remote_benchmark(config, instance, workload)
+        logs = instance.extra.get("logs", "")
+        if not logs:
+            raise RuntimeError(
+                "Cloud provider did not return container logs. "
+                "The provider must set instance.extra['logs'] after the run completes."
+            )
+        return run_cloud_benchmark(config, instance, workload, logs)

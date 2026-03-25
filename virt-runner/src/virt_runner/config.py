@@ -18,7 +18,7 @@ from virt_runner.models import (
 )
 
 DEFAULT_WORKLOAD_PATH = Path(__file__).resolve().parent.parent.parent / "workloads" / "default.json"
-DEFAULT_BENCH_IMAGE = "gpuscale-bench:latest"
+DEFAULT_BENCH_IMAGE = "ghcr.io/cmink2040/gpuscale-bench:latest"
 DEFAULT_S3_ENDPOINT = "https://s3.wasabisys.com"
 
 
@@ -28,9 +28,10 @@ class ProviderConfig(BaseModel):
     api_key: str = ""
     gpu_type: str = ""  # e.g. "RTX_4090", "A100_80GB"
     gpu_count: int = 1
-    disk_gb: int = 40
+    disk_gb: int = 100
     image: str = ""  # cloud VM image / template id
     region: str = ""
+    max_dph: float = 2.0  # max dollars per hour for cloud offers
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -45,12 +46,18 @@ class S3Config(BaseModel):
 
     @model_validator(mode="after")
     def _fill_from_env(self) -> "S3Config":
+        if not self.endpoint:
+            self.endpoint = os.getenv("S3_ENDPOINT", DEFAULT_S3_ENDPOINT)
         if not self.access_key:
-            self.access_key = os.getenv("WASABI_ACCESS_KEY", "")
+            self.access_key = os.getenv("AWS_ACCESS_KEY_ID", os.getenv("WASABI_ACCESS_KEY", ""))
         if not self.secret_key:
-            self.secret_key = os.getenv("WASABI_SECRET_KEY", "")
+            self.secret_key = os.getenv(
+                "AWS_SECRET_ACCESS_KEY", os.getenv("WASABI_SECRET_KEY", "")
+            )
         if not self.bucket:
-            self.bucket = os.getenv("WASABI_BUCKET", "")
+            self.bucket = os.getenv("S3_BUCKET", os.getenv("WASABI_BUCKET", ""))
+        if not self.model_key:
+            self.model_key = os.getenv("S3_MODEL_KEY", "")
         return self
 
 
@@ -59,7 +66,9 @@ class JobConfig(BaseModel):
 
     provider: Provider = Provider.LOCAL
     engine: InferenceEngine = InferenceEngine.LLAMA_CPP
-    model: str = ""  # model identifier, e.g. "llama-3-8b-q4"
+    model: str = ""  # model identifier, e.g. "meta-llama/Llama-3.1-8B-Instruct"
+    model_format: str = ""  # "full", "gguf", "gptq" -- auto-detected if empty
+    gguf_quant: str = ""  # e.g. "Q4_K_M"
     bench_image: str = DEFAULT_BENCH_IMAGE
     provider_config: ProviderConfig = Field(default_factory=ProviderConfig)
     s3: S3Config = Field(default_factory=S3Config)
@@ -67,10 +76,12 @@ class JobConfig(BaseModel):
     ssh_key_path: str = ""
     ssh_user: str = "root"
     timeout_s: int = 1800  # 30 min default
+    hf_token: str = ""
 
     @model_validator(mode="after")
-    def _fill_api_keys(self) -> "JobConfig":
-        """Populate API keys from environment variables if not set explicitly."""
+    def _fill_from_env(self) -> "JobConfig":
+        """Populate API keys and tokens from environment variables if not set."""
+        # Provider API keys
         if not self.provider_config.api_key:
             env_map = {
                 Provider.VAST: "VAST_API_KEY",
@@ -79,6 +90,11 @@ class JobConfig(BaseModel):
             env_var = env_map.get(self.provider, "")
             if env_var:
                 self.provider_config.api_key = os.getenv(env_var, "")
+
+        # HuggingFace token
+        if not self.hf_token:
+            self.hf_token = os.getenv("HF_TOKEN", "")
+
         return self
 
     def load_workload(self, path: Path | None = None) -> WorkloadConfig:
@@ -90,3 +106,41 @@ class JobConfig(BaseModel):
         data = json.loads(workload_path.read_text())
         self.workload = WorkloadConfig(**data)
         return self.workload
+
+    def build_container_env(self) -> dict[str, str]:
+        """Build the full set of environment variables for the bench container."""
+        env: dict[str, str] = {}
+
+        # Required
+        env["MODEL"] = self.model
+        env["ENGINE"] = self.engine.value
+
+        # Model format / quantization
+        if self.model_format:
+            env["MODEL_FORMAT"] = self.model_format
+        if self.gguf_quant:
+            env["GGUF_QUANT"] = self.gguf_quant
+
+        # S3 credentials
+        if self.s3.access_key:
+            env["AWS_ACCESS_KEY_ID"] = self.s3.access_key
+        if self.s3.secret_key:
+            env["AWS_SECRET_ACCESS_KEY"] = self.s3.secret_key
+        if self.s3.endpoint:
+            env["S3_ENDPOINT"] = self.s3.endpoint
+        if self.s3.bucket:
+            env["S3_BUCKET"] = self.s3.bucket
+        if self.s3.model_key:
+            env["S3_MODEL_KEY"] = self.s3.model_key
+
+        # HuggingFace token
+        if self.hf_token:
+            env["HF_TOKEN"] = self.hf_token
+
+        # Workload config as JSON
+        if self.workload:
+            env["WORKLOAD_CONFIG"] = json.dumps(
+                self.workload.model_dump(), separators=(",", ":")
+            )
+
+        return env
