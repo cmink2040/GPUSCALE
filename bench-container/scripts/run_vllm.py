@@ -8,15 +8,30 @@ Output format matches what virt-runner's parse_vllm_output expects:
   Generated <N> tokens
 """
 
+import os
 import sys
 import time
 
-# vLLM import — will fail if not installed (CPU-only images)
 try:
     from vllm import LLM, SamplingParams
 except ImportError:
     print("ERROR: vLLM is not installed in this container.", file=sys.stderr)
     sys.exit(1)
+
+# Cache the LLM instance across calls so we don't reload on every iteration
+_llm_cache = {}
+
+
+def get_llm(model_dir: str) -> LLM:
+    """Get or create a cached LLM instance."""
+    if model_dir not in _llm_cache:
+        print(f"Loading model from {model_dir}...", file=sys.stderr)
+        _llm_cache[model_dir] = LLM(
+            model=model_dir,
+            trust_remote_code=True,
+            dtype="float16",
+        )
+    return _llm_cache[model_dir]
 
 
 def main():
@@ -29,14 +44,9 @@ def main():
     temperature = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
     top_p = float(sys.argv[4]) if len(sys.argv) > 4 else 1.0
 
-    model_dir = "/models"
+    model_dir = os.environ.get("MODEL_DIR", "/models")
 
-    print(f"Loading model from {model_dir}...", file=sys.stderr)
-
-    # Initialize the model (this is expensive — in a real bench we'd load once)
-    # For benchmarking, each iteration call includes model load time in wall_time
-    # but the orchestrator handles warmup iterations to account for this
-    llm = LLM(model=model_dir, trust_remote_code=True)
+    llm = get_llm(model_dir)
 
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -52,9 +62,7 @@ def main():
 
     wall_time_s = end - start
     output = outputs[0]
-    generated_text = output.outputs[0].text
     num_tokens = len(output.outputs[0].token_ids)
-
     tokens_per_sec = num_tokens / wall_time_s if wall_time_s > 0 else 0
 
     # Compute TTFT from metrics if available

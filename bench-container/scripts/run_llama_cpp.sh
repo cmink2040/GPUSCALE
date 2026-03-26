@@ -8,11 +8,13 @@ MAX_TOKENS="${2:-512}"
 TEMPERATURE="${3:-0.0}"
 TOP_P="${4:-1.0}"
 
+MODEL_DIR="${MODEL_DIR:-/models}"
+
 # Find the GGUF file
-GGUF_FILE=$(find /models -name "*.gguf" -type f | head -1)
+GGUF_FILE=$(find "$MODEL_DIR" -name "*.gguf" -type f | head -1)
 
 if [ -z "$GGUF_FILE" ]; then
-    echo "ERROR: No .gguf file found in /models/. llama.cpp requires GGUF format." >&2
+    echo "ERROR: No .gguf file found in $MODEL_DIR/. llama.cpp requires GGUF format." >&2
     echo "Set MODEL_FORMAT=gguf and provide GGUF_QUANT, or use vllm for full-weight models." >&2
     exit 1
 fi

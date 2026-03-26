@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Do NOT use set -e — we handle errors per-iteration so one failure doesn't kill everything
+set -uo pipefail
 
 # =============================================================================
 # GPUSCALE Benchmark Container Entrypoint
@@ -12,6 +13,7 @@ set -euo pipefail
 #   WORKLOAD_CONFIG  - JSON string of workload spec (defaults to built-in)
 #   MODEL_FORMAT     - "full", "gguf", "gptq" (auto-detected if not set)
 #   GGUF_QUANT       - e.g. "Q4_K_M" (required for gguf)
+#   VOLUME_MOUNT_PATH - persistent volume mount (e.g. /workspace, /runpod-volume)
 #
 # For S3 models:
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_ENDPOINT, S3_BUCKET, S3_MODEL_KEY
@@ -23,6 +25,15 @@ set -euo pipefail
 echo "=== GPUSCALE Benchmark Container ===" >&2
 echo "MODEL:  ${MODEL:?MODEL env var is required}" >&2
 echo "ENGINE: ${ENGINE:?ENGINE env var is required}" >&2
+
+# Use persistent storage if available, otherwise ephemeral /models
+MODEL_DIR="/models"
+if [ -n "${VOLUME_MOUNT_PATH:-}" ] && [ -d "${VOLUME_MOUNT_PATH}" ]; then
+    MODEL_DIR="${VOLUME_MOUNT_PATH}/models/${MODEL}/${MODEL_FORMAT:-full}"
+    echo "Using persistent model dir: $MODEL_DIR" >&2
+fi
+export MODEL_DIR
+mkdir -p "$MODEL_DIR"
 
 # Default workload if not provided
 if [ -z "${WORKLOAD_CONFIG:-}" ]; then
@@ -36,7 +47,6 @@ WARMUP_ITERATIONS=$(echo "$WORKLOAD_CONFIG" | jq -r '.warmup_iterations // 1')
 MAX_TOKENS=$(echo "$WORKLOAD_CONFIG" | jq -r '.generation_params.max_tokens // 512')
 TEMPERATURE=$(echo "$WORKLOAD_CONFIG" | jq -r '.generation_params.temperature // 0.0')
 TOP_P=$(echo "$WORKLOAD_CONFIG" | jq -r '.generation_params.top_p // 1.0')
-# Count prompts
 NUM_PROMPTS=$(echo "$WORKLOAD_CONFIG" | jq '.prompts | length')
 TOTAL_ITERATIONS=$((WARMUP_ITERATIONS + ITERATIONS))
 TOTAL_RUNS=$(( TOTAL_ITERATIONS * NUM_PROMPTS ))
@@ -45,19 +55,39 @@ echo "Max tokens: $MAX_TOKENS" >&2
 
 # ---- Step 1: Pull model ----
 echo "--- Pulling model ---" >&2
-python3 /app/scripts/pull_model.py
+if ! python3 /app/scripts/pull_model.py; then
+    echo "FATAL: Model pull failed. Cannot continue." >&2
+    exit 1
+fi
 echo "--- Model ready ---" >&2
+
+# Show what we got
+echo "Model files:" >&2
+ls -lh "$MODEL_DIR"/ 2>&1 | head -20 >&2
 
 # Auto-detect model format if not set
 if [ -z "${MODEL_FORMAT:-}" ]; then
-    if ls /models/*.gguf >/dev/null 2>&1; then
+    if ls "$MODEL_DIR"/*.gguf >/dev/null 2>&1; then
         MODEL_FORMAT="gguf"
-    elif [ -f /models/quantize_config.json ]; then
+    elif [ -f "$MODEL_DIR/quantize_config.json" ]; then
         MODEL_FORMAT="gptq"
+    elif [ -f "$MODEL_DIR/config.json" ]; then
+        MODEL_FORMAT="full"
+    elif ls "$MODEL_DIR"/*.pth >/dev/null 2>&1; then
+        MODEL_FORMAT="pth"
     else
         MODEL_FORMAT="full"
     fi
     echo "Auto-detected format: $MODEL_FORMAT" >&2
+fi
+
+# Validate engine + format compatibility
+if [ "$ENGINE" = "vllm" ] && [ "$MODEL_FORMAT" = "pth" ]; then
+    echo "ERROR: vLLM cannot load Meta .pth format directly." >&2
+    echo "Either upload HuggingFace format to S3, or use --engine llama.cpp" >&2
+    echo "Listing model dir for debugging:" >&2
+    ls -la "$MODEL_DIR"/ >&2
+    exit 1
 fi
 
 # ---- Step 2: Start GPU metrics collection ----
@@ -65,7 +95,10 @@ echo "--- Starting GPU metrics collection ---" >&2
 /app/scripts/collect_metrics.sh start
 
 # ---- Step 3: Run benchmark ----
-echo "--- Running benchmark ($ENGINE, $TOTAL_ITERATIONS iterations) ---" >&2
+echo "--- Running benchmark ($ENGINE, $TOTAL_ITERATIONS iterations x $NUM_PROMPTS prompts) ---" >&2
+
+ERRORS=0
+SUCCESSES=0
 
 for i in $(seq 1 "$TOTAL_ITERATIONS"); do
     if [ "$i" -le "$WARMUP_ITERATIONS" ]; then
@@ -82,18 +115,30 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
 
         case "$ENGINE" in
             llama.cpp)
-                /app/scripts/run_llama_cpp.sh "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"
+                if /app/scripts/run_llama_cpp.sh "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                    SUCCESSES=$((SUCCESSES + 1))
+                else
+                    echo "WARNING: llama.cpp failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
+                    ERRORS=$((ERRORS + 1))
+                fi
                 ;;
             vllm)
-                python3 /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"
+                if python3 /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                    SUCCESSES=$((SUCCESSES + 1))
+                else
+                    echo "WARNING: vLLM failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
+                    ERRORS=$((ERRORS + 1))
+                fi
                 ;;
             *)
                 echo "ERROR: Unknown engine: $ENGINE" >&2
-                exit 1
+                ERRORS=$((ERRORS + 1))
                 ;;
         esac
     done
 done
+
+echo "--- Benchmark complete: $SUCCESSES succeeded, $ERRORS failed ---" >&2
 
 # ---- Step 4: Stop GPU metrics, emit result ----
 echo "--- Stopping GPU metrics collection ---" >&2
@@ -103,3 +148,6 @@ echo "--- Stopping GPU metrics collection ---" >&2
 echo "=== GPU_METRICS_START ==="
 cat /tmp/gpu_metrics.csv 2>/dev/null || true
 echo "=== GPU_METRICS_END ==="
+
+# Exit 0 even if some iterations failed — partial results are still useful
+exit 0
