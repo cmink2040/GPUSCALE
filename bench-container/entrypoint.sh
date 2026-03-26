@@ -165,10 +165,33 @@ echo "--- Benchmark complete: $SUCCESSES succeeded, $ERRORS failed ---" >&2
 echo "--- Stopping GPU metrics collection ---" >&2
 /app/scripts/collect_metrics.sh stop
 
-# Print the nvidia-smi CSV data so the orchestrator can parse it
-echo "=== GPU_METRICS_START ==="
-cat /tmp/gpu_metrics.csv 2>/dev/null || true
-echo "=== GPU_METRICS_END ==="
+# Collect all output into a result file for retrieval
+RESULT_FILE="/workspace/gpuscale_result.txt"
+{
+    echo "=== GPU_METRICS_START ==="
+    cat /tmp/gpu_metrics.csv 2>/dev/null || true
+    echo "=== GPU_METRICS_END ==="
+    echo "=== BENCHMARK_SUMMARY ==="
+    echo "successes=$SUCCESSES"
+    echo "errors=$ERRORS"
+    echo "engine=$ENGINE"
+    echo "model=$MODEL"
+    echo "model_format=$MODEL_FORMAT"
+} > "$RESULT_FILE" 2>/dev/null || true
 
-# Exit 0 even if some iterations failed — partial results are still useful
-exit 0
+# Also print to stdout (in case logs ever become retrievable)
+cat "$RESULT_FILE" 2>/dev/null || true
+
+echo "Results written to $RESULT_FILE" >&2
+echo "--- Benchmark done. Results available via SSH at $RESULT_FILE ---" >&2
+
+# Keep the container alive briefly so SSH can retrieve results
+# The orchestrator will SSH in, cat the result file, then teardown
+sleep infinity &
+SLEEP_PID=$!
+
+# Write a marker file so the orchestrator knows the benchmark is done
+touch /workspace/gpuscale_done
+
+echo "Waiting for result retrieval (container will stay alive until terminated)..." >&2
+wait $SLEEP_PID 2>/dev/null || true

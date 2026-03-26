@@ -180,10 +180,15 @@ class RunPodProvider(BaseProvider):
         )
 
     def wait_ready(self, instance: ProvisionedInstance, timeout_s: int = 1800) -> bool:
-        """Poll until the RunPod pod finishes running the benchmark container."""
+        """Wait for the container to start, then SSH in to retrieve results.
+
+        The container runs the benchmark and writes results to /workspace/gpuscale_result.txt,
+        then stays alive so we can SSH in. We poll until the container is running,
+        then use _fetch_logs (which SSHes in) to get the results.
+        """
         console.print(
             f"[bold]Waiting for pod {instance.instance_id} "
-            f"to complete (timeout {timeout_s}s)...[/bold]"
+            f"to start (timeout {timeout_s}s)...[/bold]"
         )
 
         query = """
@@ -199,9 +204,8 @@ class RunPodProvider(BaseProvider):
         """
         deadline = time.time() + timeout_s
         poll_interval = 15
-        last_status = ""
-        saw_runtime = False  # Track if the container actually started
 
+        # Phase 1: Wait for container to actually start (runtime != null)
         while time.time() < deadline:
             try:
                 data = self._graphql(query, {"input": {"podId": instance.instance_id}})
@@ -212,49 +216,24 @@ class RunPodProvider(BaseProvider):
 
             pod = data.get("pod")
             if pod is None:
-                console.print("[yellow]Pod not found -- may have already exited.[/yellow]")
-                logs = self._fetch_logs(instance.instance_id)
-                if logs:
-                    instance.extra["logs"] = logs
-                    return True
+                console.print("[yellow]Pod not found.[/yellow]")
                 return False
 
             status = pod.get("desiredStatus", "unknown")
             runtime = pod.get("runtime")
 
-            if status != last_status:
-                console.print(f"  Pod status: [cyan]{status}[/cyan]")
-                last_status = status
-
-            # runtime=None + RUNNING means still pulling image / initializing
-            # runtime present + RUNNING means container is actively running
             if runtime is not None:
-                if not saw_runtime:
-                    uptime = runtime.get("uptimeInSeconds", 0)
-                    console.print(f"  Container started (uptime: {uptime}s)")
-                    saw_runtime = True
-
-            if status == "RUNNING" and runtime is None:
-                if saw_runtime:
-                    # Runtime disappeared — container exited
-                    console.print("[green]Container finished (runtime cleared).[/green]")
-                else:
-                    # Still initializing / pulling image
-                    pass
+                uptime = runtime.get("uptimeInSeconds", 0)
+                console.print(f"  Container running (uptime: {uptime}s). Fetching results via SSH...")
+                break
+            else:
+                console.print(f"  Pod status: [cyan]{status}[/cyan] (waiting for container to start)")
                 time.sleep(poll_interval)
-                continue
+        else:
+            console.print("[red]Timeout waiting for container to start.[/red]")
+            return False
 
-            if status == "EXITED":
-                console.print("[green]Container exited.[/green]")
-                logs = self._fetch_logs(instance.instance_id)
-                if logs:
-                    instance.extra["logs"] = logs
-                    return True
-                return False
-
-            time.sleep(poll_interval)
-
-        console.print("[red]Timeout waiting for pod to complete.[/red]")
+        # Phase 2: SSH in and wait for benchmark to finish, then get results
         logs = self._fetch_logs(instance.instance_id)
         if logs:
             instance.extra["logs"] = logs
@@ -451,45 +430,83 @@ class RunPodProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     def _fetch_logs(self, pod_id: str) -> str:
-        """Fetch container logs from a RunPod pod via REST API."""
-        console.print(f"[bold]Fetching logs for pod {pod_id}...[/bold]")
+        """Fetch benchmark results from a RunPod pod via SSH.
 
-        # RunPod exposes logs via their REST API
+        RunPod has no logs API for pods. Instead, the container writes results
+        to /workspace/gpuscale_result.txt and stays alive. We SSH in, cat the
+        file, and return the contents.
+        """
+        console.print(f"[bold]Fetching results from pod {pod_id} via SSH...[/bold]")
+
+        # Get SSH connection info
+        ssh_info = self._get_ssh_info(pod_id)
+        if not ssh_info:
+            console.print("[red]Could not get SSH connection info.[/red]")
+            return ""
+
+        host, port = ssh_info
+        result_file = "/workspace/gpuscale_result.txt"
+        done_marker = "/workspace/gpuscale_done"
+
+        import paramiko
+
         try:
-            resp = self._client.get(
-                f"https://api.runpod.io/v2/{pod_id}/status",
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                output = data.get("output", "")
-                if output:
-                    console.print(f"[green]Retrieved output from REST API.[/green]")
-                    return str(output)
-        except Exception:
-            pass
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(host, port=port, username="root", timeout=30)
 
-        # Fallback: try GraphQL with different query formats
-        queries = [
-            ("query { pod(input: {podId: \"%s\"}) { runtime { logs } } }" % pod_id, None),
-        ]
+            # Wait for the benchmark to finish (check for done marker)
+            deadline = time.time() + 1800
+            while time.time() < deadline:
+                _, stdout, _ = client.exec_command(f"test -f {done_marker} && echo DONE || echo WAITING")
+                status = stdout.read().decode().strip()
+                if status == "DONE":
+                    break
+                console.print("[dim]  Benchmark still running...[/dim]")
+                time.sleep(15)
 
-        for query, variables in queries:
+            # Cat the result file
+            _, stdout, stderr = client.exec_command(f"cat {result_file}")
+            logs = stdout.read().decode()
+            err = stderr.read().decode()
+
+            if logs:
+                console.print(f"[green]Retrieved {len(logs)} bytes of results via SSH.[/green]")
+            else:
+                console.print(f"[yellow]Result file empty or missing. stderr: {err[:200]}[/yellow]")
+
+            client.close()
+            return logs
+
+        except Exception as exc:
+            console.print(f"[red]SSH fetch failed: {exc}[/red]")
+            return ""
+
+    def _get_ssh_info(self, pod_id: str) -> tuple[str, int] | None:
+        """Get SSH host and port for a RunPod pod."""
+        # Poll until SSH port is available
+        deadline = time.time() + 120
+        while time.time() < deadline:
             try:
-                data = self._graphql(query, variables)
-                # Navigate to logs in response
-                pod = data.get("pod", {})
-                if pod:
-                    runtime = pod.get("runtime") or {}
-                    logs = runtime.get("logs", "")
-                    if logs:
-                        console.print(f"[green]Retrieved {len(logs)} bytes of logs.[/green]")
-                        return logs
-            except Exception as exc:
-                console.print(f"[dim]Log query failed: {exc}[/dim]")
-                continue
-
-        console.print("[yellow]Could not retrieve logs.[/yellow]")
-        return ""
+                data = self._graphql(
+                    'query { pod(input: {podId: "%s"}) { runtime { ports { ip isIpPublic privatePort publicPort } } } }' % pod_id
+                )
+                pod = data.get("pod")
+                if not pod or not pod.get("runtime"):
+                    time.sleep(5)
+                    continue
+                ports = pod["runtime"].get("ports", [])
+                for p in ports:
+                    if p.get("privatePort") == 22 and p.get("isIpPublic"):
+                        return (p["ip"], int(p["publicPort"]))
+                # Sometimes SSH is on a different port
+                for p in ports:
+                    if p.get("isIpPublic"):
+                        return (p["ip"], int(p["publicPort"]))
+            except Exception:
+                pass
+            time.sleep(5)
+        return None
 
     def _terminate_pod(self, pod_id: str) -> None:
         """Terminate a pod silently."""
