@@ -2,7 +2,7 @@
 name = "gpuscale-bench"
 version = "0.1.0"
 description = "GPUSCALE benchmark container runtime"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
     "boto3>=1.35.0",
     "huggingface-hub>=0.27.0",
@@ -12,3 +12,6 @@ dependencies = [
     "numpy>=1.24.0",
     "llama-models>=0.3.0",
 ]
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]

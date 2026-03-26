@@ -2,10 +2,8 @@
 # Do NOT use set -e — we handle errors per-iteration so one failure doesn't kill everything
 set -uo pipefail
 
-# Activate uv venv if it exists (created by uv sync during docker build)
-if [ -f /app/.venv/bin/activate ]; then
-    source /app/.venv/bin/activate
-fi
+# All Python calls go through uv run to use the correct venv (Python 3.14 + CUDA PyTorch)
+PY="uv run --project /app python"
 
 # =============================================================================
 # GPUSCALE Benchmark Container Entrypoint
@@ -64,7 +62,7 @@ echo "Max tokens: $MAX_TOKENS" >&2
 
 # ---- Step 1: Pull model ----
 echo "--- Pulling model ---" >&2
-if ! python3 /app/scripts/pull_model.py; then
+if ! $PY /app/scripts/pull_model.py; then
     echo "FATAL: Model pull failed. Cannot continue." >&2
     exit 1
 fi
@@ -95,7 +93,6 @@ echo "Detected model format: $MODEL_FORMAT" >&2
 
 # Route engine based on what we actually have
 if [ "$HAS_PTH" = true ]; then
-    # Meta .pth files — must use meta-native (not vllm, not llama.cpp)
     if [ "$ENGINE" != "meta-native" ]; then
         echo "Meta .pth format detected — switching engine from $ENGINE to meta-native." >&2
         ENGINE="meta-native"
@@ -139,7 +136,7 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
                 fi
                 ;;
             vllm)
-                if python3 /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                if $PY /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
                     SUCCESSES=$((SUCCESSES + 1))
                 else
                     echo "WARNING: vLLM failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
@@ -147,7 +144,7 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
                 fi
                 ;;
             meta-native)
-                if python3 /app/scripts/run_meta_native.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                if $PY /app/scripts/run_meta_native.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
                     SUCCESSES=$((SUCCESSES + 1))
                 else
                     echo "WARNING: Meta native failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2

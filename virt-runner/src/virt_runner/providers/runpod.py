@@ -120,11 +120,44 @@ class RunPodProvider(BaseProvider):
             pod_input["volumeInGb"] = pc.disk_gb
             pod_input["volumeMountPath"] = "/workspace"
 
-        data = self._graphql(mutation, {"input": pod_input})
-        pod = data.get("podFindAndDeployOnDemand", {})
+        # If using a network volume, try multiple GPU types in case the primary isn't available
+        gpu_fallbacks = [
+            gpu_type,
+            "NVIDIA RTX A5000",
+            "NVIDIA GeForce RTX 3090",
+            "NVIDIA RTX A6000",
+            "NVIDIA GeForce RTX 4090",
+            "NVIDIA RTX A4000",
+            "NVIDIA GeForce RTX 3080",
+        ]
+        # Deduplicate while preserving order
+        seen = set()
+        gpu_fallbacks = [g for g in gpu_fallbacks if not (g in seen or seen.add(g))]
+
+        pod = {}
+        last_error = None
+        for try_gpu in gpu_fallbacks:
+            try:
+                pod_input["gpuTypeId"] = try_gpu
+                pod_input["name"] = f"gpuscale-bench-{try_gpu.replace(' ', '-').lower()}"
+                console.print(f"[dim]Trying {try_gpu}...[/dim]")
+                data = self._graphql(mutation, {"input": pod_input})
+                pod = data.get("podFindAndDeployOnDemand", {})
+                if pod.get("id"):
+                    gpu_type = try_gpu  # Update for display
+                    break
+            except RuntimeError as e:
+                last_error = e
+                if "SUPPLY_CONSTRAINT" in str(e) or "does not have the resources" in str(e):
+                    console.print(f"[dim]  No supply for {try_gpu}[/dim]")
+                    continue
+                raise
+
         pod_id = pod.get("id", "")
         if not pod_id:
-            raise RuntimeError(f"Failed to create RunPod pod. Response: {data}")
+            raise RuntimeError(
+                f"No GPU available in the volume's datacenter. Last error: {last_error}"
+            )
 
         gpu_display = (
             pod.get("machine", {}).get("gpuDisplayName", gpu_type)

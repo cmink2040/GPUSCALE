@@ -16,8 +16,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Copy project definition and sync dependencies
 COPY pyproject.toml /app/pyproject.toml
 WORKDIR /app
-RUN uv sync --no-dev --no-install-project \
-    && uv run python3 -c "from models.llama3.generation import Llama3; print('llama-models OK')"
+RUN uv sync --python 3.14 --no-dev --no-install-project \
+    && uv run python -c "import torch; print(f'torch {torch.__version__} cuda={torch.cuda.is_available()}'); from models.llama3.generation import Llama3; print('llama-models OK')"
 
 # Application code
 COPY entrypoint.sh /app/entrypoint.sh
