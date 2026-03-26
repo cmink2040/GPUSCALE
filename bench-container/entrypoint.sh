@@ -81,13 +81,10 @@ if [ -z "${MODEL_FORMAT:-}" ]; then
     echo "Auto-detected format: $MODEL_FORMAT" >&2
 fi
 
-# Validate engine + format compatibility
-if [ "$ENGINE" = "vllm" ] && [ "$MODEL_FORMAT" = "pth" ]; then
-    echo "ERROR: vLLM cannot load Meta .pth format directly." >&2
-    echo "Either upload HuggingFace format to S3, or use --engine llama.cpp" >&2
-    echo "Listing model dir for debugging:" >&2
-    ls -la "$MODEL_DIR"/ >&2
-    exit 1
+# If we have .pth files and engine is vllm, switch to meta-native runner
+if [ "$MODEL_FORMAT" = "pth" ] && [ "$ENGINE" = "vllm" ]; then
+    echo "Detected Meta .pth format with vllm engine — using Meta native inference instead." >&2
+    ENGINE="meta-native"
 fi
 
 # ---- Step 2: Start GPU metrics collection ----
@@ -127,6 +124,14 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
                     SUCCESSES=$((SUCCESSES + 1))
                 else
                     echo "WARNING: vLLM failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
+                    ERRORS=$((ERRORS + 1))
+                fi
+                ;;
+            meta-native)
+                if python3 /app/scripts/run_meta_native.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                    SUCCESSES=$((SUCCESSES + 1))
+                else
+                    echo "WARNING: Meta native failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
                     ERRORS=$((ERRORS + 1))
                 fi
                 ;;

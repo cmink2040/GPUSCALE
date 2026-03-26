@@ -112,32 +112,7 @@ def main():
     if already_downloaded():
         return
 
-    # For vLLM with S3: warn if the S3 model is likely Meta .pth format
-    # vLLM needs HuggingFace format (config.json, safetensors, tokenizer.json)
-    if ENGINE == "vllm" and os.environ.get("S3_BUCKET") and S3_MODEL_KEY:
-        print("NOTE: vLLM requires HuggingFace format. If S3 has Meta .pth format, "
-              "will fall back to HuggingFace Hub download.", file=sys.stderr)
-        # Try S3 first, then check if it's the right format
-        pull_from_s3()
-        # Check if we got HuggingFace format
-        if os.path.exists(os.path.join(MODEL_DIR, "config.json")):
-            return  # Good, HF format
-        # Check if we got Meta .pth format instead
-        pth_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".pth")]
-        if pth_files:
-            print("WARNING: S3 model is in Meta .pth format, not HuggingFace format.", file=sys.stderr)
-            print("Clearing and downloading HuggingFace format instead...", file=sys.stderr)
-            # Clear the .pth files to avoid confusion
-            for f in os.listdir(MODEL_DIR):
-                fpath = os.path.join(MODEL_DIR, f)
-                if os.path.isfile(fpath):
-                    os.remove(fpath)
-            # Fall through to HuggingFace download
-            pull_from_huggingface()
-            return
-        return
-
-    # Priority 1: Pull from S3 (private/gated models)
+    # Priority 1: Pull from S3 (private/gated models — includes Meta .pth format)
     if os.environ.get("S3_BUCKET") and S3_MODEL_KEY:
         pull_from_s3()
         return
