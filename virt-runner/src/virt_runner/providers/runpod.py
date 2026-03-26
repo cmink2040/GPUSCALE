@@ -107,9 +107,10 @@ class RunPodProvider(BaseProvider):
             "gpuTypeId": gpu_type,
             "gpuCount": gpu_count,
             "containerDiskInGb": 40,
-            "startSsh": False,
+            "startSsh": True,
             "env": env_list,
             "dockerArgs": "/app/entrypoint.sh",
+            "cloudType": "SECURE",
         }
 
         # Attach network volume if configured
@@ -224,7 +225,7 @@ class RunPodProvider(BaseProvider):
 
             if runtime is not None:
                 uptime = runtime.get("uptimeInSeconds", 0)
-                console.print(f"  Container running (uptime: {uptime}s). Fetching results via SSH...")
+                console.print(f"  Container running (uptime: {uptime}s). Polling S3 for results...")
                 break
             else:
                 console.print(f"  Pod status: [cyan]{status}[/cyan] (waiting for container to start)")
@@ -430,83 +431,71 @@ class RunPodProvider(BaseProvider):
     # ------------------------------------------------------------------
 
     def _fetch_logs(self, pod_id: str) -> str:
-        """Fetch benchmark results from a RunPod pod via SSH.
+        """Fetch benchmark results from S3.
 
-        RunPod has no logs API for pods. Instead, the container writes results
-        to /workspace/gpuscale_result.txt and stays alive. We SSH in, cat the
-        file, and return the contents.
+        The container uploads results to s3://<bucket>/results/<hostname>_<timestamp>.txt
+        We poll S3 for new result files until one appears.
         """
-        console.print(f"[bold]Fetching results from pod {pod_id} via SSH...[/bold]")
+        import boto3
 
-        # Get SSH connection info
-        ssh_info = self._get_ssh_info(pod_id)
-        if not ssh_info:
-            console.print("[red]Could not get SSH connection info.[/red]")
+        s3 = self.config.s3
+        if not s3.bucket or not s3.access_key:
+            console.print("[red]No S3 config — cannot retrieve results.[/red]")
             return ""
 
-        host, port = ssh_info
-        result_file = "/workspace/gpuscale_result.txt"
-        done_marker = "/workspace/gpuscale_done"
+        console.print(f"[bold]Waiting for results in s3://{s3.bucket}/results/...[/bold]")
 
-        import paramiko
+        client = boto3.client(
+            "s3",
+            endpoint_url=s3.endpoint,
+            aws_access_key_id=s3.access_key,
+            aws_secret_access_key=s3.secret_key,
+            region_name=os.getenv("WASABI_REGION", "us-east-1"),
+        )
 
+        # Record existing result files so we can detect new ones
+        existing_keys: set[str] = set()
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(host, port=port, username="root", timeout=30)
+            resp = client.list_objects_v2(Bucket=s3.bucket, Prefix="results/")
+            for obj in resp.get("Contents", []):
+                existing_keys.add(obj["Key"])
+        except Exception:
+            pass
 
-            # Wait for the benchmark to finish (check for done marker)
-            deadline = time.time() + 1800
-            while time.time() < deadline:
-                _, stdout, _ = client.exec_command(f"test -f {done_marker} && echo DONE || echo WAITING")
-                status = stdout.read().decode().strip()
-                if status == "DONE":
-                    break
-                console.print("[dim]  Benchmark still running...[/dim]")
-                time.sleep(15)
-
-            # Cat the result file
-            _, stdout, stderr = client.exec_command(f"cat {result_file}")
-            logs = stdout.read().decode()
-            err = stderr.read().decode()
-
-            if logs:
-                console.print(f"[green]Retrieved {len(logs)} bytes of results via SSH.[/green]")
-            else:
-                console.print(f"[yellow]Result file empty or missing. stderr: {err[:200]}[/yellow]")
-
-            client.close()
-            return logs
-
-        except Exception as exc:
-            console.print(f"[red]SSH fetch failed: {exc}[/red]")
-            return ""
-
-    def _get_ssh_info(self, pod_id: str) -> tuple[str, int] | None:
-        """Get SSH host and port for a RunPod pod."""
-        # Poll until SSH port is available
-        deadline = time.time() + 120
+        # Poll for new result files
+        deadline = time.time() + 1800
         while time.time() < deadline:
+            # Also check if pod is still alive
             try:
                 data = self._graphql(
-                    'query { pod(input: {podId: "%s"}) { runtime { ports { ip isIpPublic privatePort publicPort } } } }' % pod_id
+                    'query { pod(input: {podId: "%s"}) { id desiredStatus runtime { uptimeInSeconds } } }' % pod_id
                 )
                 pod = data.get("pod")
-                if not pod or not pod.get("runtime"):
-                    time.sleep(5)
-                    continue
-                ports = pod["runtime"].get("ports", [])
-                for p in ports:
-                    if p.get("privatePort") == 22 and p.get("isIpPublic"):
-                        return (p["ip"], int(p["publicPort"]))
-                # Sometimes SSH is on a different port
-                for p in ports:
-                    if p.get("isIpPublic"):
-                        return (p["ip"], int(p["publicPort"]))
+                if pod:
+                    rt = pod.get("runtime")
+                    uptime = rt.get("uptimeInSeconds", 0) if rt else 0
+                    console.print(f"[dim]  Pod uptime: {uptime}s, checking S3...[/dim]")
             except Exception:
                 pass
-            time.sleep(5)
-        return None
+
+            # Check for new result files
+            try:
+                resp = client.list_objects_v2(Bucket=s3.bucket, Prefix="results/")
+                for obj in resp.get("Contents", []):
+                    if obj["Key"] not in existing_keys:
+                        # New result file found
+                        console.print(f"[green]Found result: {obj['Key']}[/green]")
+                        result = client.get_object(Bucket=s3.bucket, Key=obj["Key"])
+                        logs = result["Body"].read().decode()
+                        console.print(f"[green]Retrieved {len(logs)} bytes of results from S3.[/green]")
+                        return logs
+            except Exception as exc:
+                console.print(f"[dim]  S3 poll error: {exc}[/dim]")
+
+            time.sleep(15)
+
+        console.print("[red]Timeout waiting for results in S3.[/red]")
+        return ""
 
     def _terminate_pod(self, pod_id: str) -> None:
         """Terminate a pod silently."""

@@ -165,7 +165,7 @@ echo "--- Benchmark complete: $SUCCESSES succeeded, $ERRORS failed ---" >&2
 echo "--- Stopping GPU metrics collection ---" >&2
 /app/scripts/collect_metrics.sh stop
 
-# Collect all output into a result file for retrieval
+# Collect all output into a result file
 RESULT_FILE="/workspace/gpuscale_result.txt"
 {
     echo "=== GPU_METRICS_START ==="
@@ -179,19 +179,27 @@ RESULT_FILE="/workspace/gpuscale_result.txt"
     echo "model_format=$MODEL_FORMAT"
 } > "$RESULT_FILE" 2>/dev/null || true
 
-# Also print to stdout (in case logs ever become retrievable)
+# Also print to stdout
 cat "$RESULT_FILE" 2>/dev/null || true
 
-echo "Results written to $RESULT_FILE" >&2
-echo "--- Benchmark done. Results available via SSH at $RESULT_FILE ---" >&2
+# Upload results to S3 so the orchestrator can retrieve them without SSH
+RESULT_S3_KEY="results/${HOSTNAME:-unknown}_$(date +%s).txt"
+echo "--- Uploading results to S3: s3://${S3_BUCKET:-}/${RESULT_S3_KEY} ---" >&2
+$PY -c "
+import os, boto3
+bucket = os.environ.get('S3_BUCKET', '')
+if not bucket:
+    print('No S3_BUCKET set, skipping upload')
+    exit(0)
+client = boto3.client('s3',
+    endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', ''),
+    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', ''),
+    region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'),
+)
+client.upload_file('$RESULT_FILE', bucket, '$RESULT_S3_KEY')
+print(f'Uploaded to s3://{bucket}/$RESULT_S3_KEY')
+" 2>&1 || echo "WARNING: S3 upload failed" >&2
 
-# Keep the container alive briefly so SSH can retrieve results
-# The orchestrator will SSH in, cat the result file, then teardown
-sleep infinity &
-SLEEP_PID=$!
-
-# Write a marker file so the orchestrator knows the benchmark is done
-touch /workspace/gpuscale_done
-
-echo "Waiting for result retrieval (container will stay alive until terminated)..." >&2
-wait $SLEEP_PID 2>/dev/null || true
+echo "--- Benchmark complete ---" >&2
+exit 0
