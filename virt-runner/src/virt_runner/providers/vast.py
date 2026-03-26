@@ -73,7 +73,8 @@ class VastProvider(BaseProvider):
             f"num_gpus={gpu_count} "
             f"disk_space>={disk_gb} "
             f"dph<={max_dph} "
-            f"inet_down>200"
+            f"inet_down>500 "
+            f"reliability>0.95"
         )
         search_result = _vast_cli(
             "search", "offers", query,
@@ -130,6 +131,7 @@ class VastProvider(BaseProvider):
             "--image", image,
             "--disk", str(disk_gb),
             "--env", env_str,
+            "--onstart-cmd", "/app/entrypoint.sh",
             "--raw",
         ]
         create_result = _vast_cli(*create_args, api_key=self.api_key)

@@ -38,7 +38,7 @@ class ProviderConfig(BaseModel):
 class S3Config(BaseModel):
     """S3/Wasabi configuration for model storage."""
 
-    endpoint: str = DEFAULT_S3_ENDPOINT
+    endpoint: str = ""
     access_key: str = ""
     secret_key: str = ""
     bucket: str = ""
@@ -47,7 +47,7 @@ class S3Config(BaseModel):
     @model_validator(mode="after")
     def _fill_from_env(self) -> "S3Config":
         if not self.endpoint:
-            self.endpoint = os.getenv("S3_ENDPOINT", DEFAULT_S3_ENDPOINT)
+            self.endpoint = os.getenv("WASABI_ENDPOINT", os.getenv("S3_ENDPOINT", DEFAULT_S3_ENDPOINT))
         if not self.access_key:
             self.access_key = os.getenv("AWS_ACCESS_KEY_ID", os.getenv("WASABI_ACCESS_KEY", ""))
         if not self.secret_key:
@@ -121,17 +121,21 @@ class JobConfig(BaseModel):
         if self.gguf_quant:
             env["GGUF_QUANT"] = self.gguf_quant
 
-        # S3 credentials
-        if self.s3.access_key:
+        # S3 credentials — only include if we have bucket + keys
+        if self.s3.access_key and self.s3.bucket:
             env["AWS_ACCESS_KEY_ID"] = self.s3.access_key
-        if self.s3.secret_key:
             env["AWS_SECRET_ACCESS_KEY"] = self.s3.secret_key
-        if self.s3.endpoint:
             env["S3_ENDPOINT"] = self.s3.endpoint
-        if self.s3.bucket:
             env["S3_BUCKET"] = self.s3.bucket
-        if self.s3.model_key:
-            env["S3_MODEL_KEY"] = self.s3.model_key
+            env["AWS_DEFAULT_REGION"] = os.getenv("WASABI_REGION", "us-east-1")
+
+            # Auto-derive model key from model name + format if not explicitly set
+            model_key = self.s3.model_key
+            if not model_key and self.model:
+                fmt = self.model_format or "full"
+                model_key = f"{self.model}/{fmt}"
+            if model_key:
+                env["S3_MODEL_KEY"] = model_key
 
         # HuggingFace token
         if self.hf_token:
