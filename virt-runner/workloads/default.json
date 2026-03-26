@@ -3,7 +3,15 @@
   "prompts": [
     {
       "role": "user",
-      "content": "Explain the concept of GPU memory bandwidth and how it affects large language model inference performance. Include specific examples of how different memory types (HBM2e, GDDR6X) compare in real-world LLM serving scenarios."
+      "content": "What is the capital of France?"
+    },
+    {
+      "role": "user",
+      "content": "Explain the difference between TCP and UDP protocols. When would you use one over the other? Give concrete examples of applications that use each protocol and why that choice makes sense."
+    },
+    {
+      "role": "user",
+      "content": "You are a senior software architect reviewing a system design. The system is a real-time bidding platform for digital advertising that needs to handle 500,000 requests per second with a p99 latency under 50ms. The current proposal uses a microservices architecture with the following components:\n\n1. A load balancer distributing traffic across bid request handlers\n2. A feature store (Redis cluster) for real-time user profile lookups\n3. A machine learning inference service running bid prediction models\n4. A Kafka-based event pipeline for logging and analytics\n5. A PostgreSQL database for campaign management and budget tracking\n\nThe team is concerned about three issues: (a) the ML inference service adds 15-20ms of latency per request, (b) Redis cluster failover causes 2-3 second disruptions, and (c) the Kafka pipeline occasionally drops events during peak load.\n\nProvide a detailed technical review addressing each concern. Suggest specific architectural improvements, alternative technologies where appropriate, and explain the tradeoffs of your recommendations. Include considerations for deployment, monitoring, and gradual rollout of changes."
     }
   ],
   "generation_params": {
@@ -11,6 +19,6 @@
     "temperature": 0.0,
     "top_p": 1.0
   },
-  "iterations": 5,
+  "iterations": 3,
   "warmup_iterations": 1
 }

@@ -19,11 +19,12 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
     https://github.com/ggerganov/llama.cpp /llama.cpp
 
 WORKDIR /llama.cpp
+# Make the CUDA driver stub visible to the linker at build time.
+# The real libcuda.so.1 is provided by the host GPU driver at runtime.
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1
 RUN cmake -B build \
     -DGGML_CUDA=ON \
     -DCMAKE_CUDA_ARCHITECTURES="60;70;75;80;86;89;90" \
-    -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
     && cmake --build build --config Release -j$(nproc)
 
 # ---------------------------------------------------------------------------

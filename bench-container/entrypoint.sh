@@ -36,11 +36,11 @@ WARMUP_ITERATIONS=$(echo "$WORKLOAD_CONFIG" | jq -r '.warmup_iterations // 1')
 MAX_TOKENS=$(echo "$WORKLOAD_CONFIG" | jq -r '.generation_params.max_tokens // 512')
 TEMPERATURE=$(echo "$WORKLOAD_CONFIG" | jq -r '.generation_params.temperature // 0.0')
 TOP_P=$(echo "$WORKLOAD_CONFIG" | jq -r '.generation_params.top_p // 1.0')
-# Extract first prompt (used for all iterations)
-PROMPT=$(echo "$WORKLOAD_CONFIG" | jq -r '.prompts[0].content // "Hello, how are you?"')
-
+# Count prompts
+NUM_PROMPTS=$(echo "$WORKLOAD_CONFIG" | jq '.prompts | length')
 TOTAL_ITERATIONS=$((WARMUP_ITERATIONS + ITERATIONS))
-echo "Iterations: $ITERATIONS (+ $WARMUP_ITERATIONS warmup)" >&2
+TOTAL_RUNS=$(( TOTAL_ITERATIONS * NUM_PROMPTS ))
+echo "Prompts: $NUM_PROMPTS, Iterations: $ITERATIONS (+ $WARMUP_ITERATIONS warmup), Total runs: $TOTAL_RUNS" >&2
 echo "Max tokens: $MAX_TOKENS" >&2
 
 # ---- Step 1: Pull model ----
@@ -69,24 +69,30 @@ echo "--- Running benchmark ($ENGINE, $TOTAL_ITERATIONS iterations) ---" >&2
 
 for i in $(seq 1 "$TOTAL_ITERATIONS"); do
     if [ "$i" -le "$WARMUP_ITERATIONS" ]; then
-        echo "--- Warmup iteration $i/$WARMUP_ITERATIONS ---" >&2
+        ITER_LABEL="Warmup iteration $i/$WARMUP_ITERATIONS"
     else
         REAL_ITER=$((i - WARMUP_ITERATIONS))
-        echo "--- Iteration $REAL_ITER/$ITERATIONS ---" >&2
+        ITER_LABEL="Iteration $REAL_ITER/$ITERATIONS"
     fi
 
-    case "$ENGINE" in
-        llama.cpp)
-            /app/scripts/run_llama_cpp.sh "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"
-            ;;
-        vllm)
-            python3 /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"
-            ;;
-        *)
-            echo "ERROR: Unknown engine: $ENGINE" >&2
-            exit 1
-            ;;
-    esac
+    for p in $(seq 0 $((NUM_PROMPTS - 1))); do
+        PROMPT=$(echo "$WORKLOAD_CONFIG" | jq -r ".prompts[$p].content")
+        PROMPT_LEN=${#PROMPT}
+        echo "--- $ITER_LABEL, prompt $((p+1))/$NUM_PROMPTS ($PROMPT_LEN chars) ---" >&2
+
+        case "$ENGINE" in
+            llama.cpp)
+                /app/scripts/run_llama_cpp.sh "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"
+                ;;
+            vllm)
+                python3 /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"
+                ;;
+            *)
+                echo "ERROR: Unknown engine: $ENGINE" >&2
+                exit 1
+                ;;
+        esac
+    done
 done
 
 # ---- Step 4: Stop GPU metrics, emit result ----
