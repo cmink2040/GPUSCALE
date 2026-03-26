@@ -3,7 +3,7 @@
 # Uses prebuilt llama.cpp image — no compilation needed
 # =============================================================================
 
-FROM ghcr.io/ggml-org/llama.cpp:full
+FROM ghcr.io/ggml-org/llama.cpp:light-cuda
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
