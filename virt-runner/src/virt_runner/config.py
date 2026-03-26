@@ -115,6 +115,12 @@ class JobConfig(BaseModel):
         env["MODEL"] = self.model
         env["ENGINE"] = self.engine.value
 
+        # Distributed env for Meta native inference (fairscale requires these)
+        env["RANK"] = "0"
+        env["WORLD_SIZE"] = "1"
+        env["MASTER_ADDR"] = "localhost"
+        env["MASTER_PORT"] = "29500"
+
         # Model format / quantization
         if self.model_format:
             env["MODEL_FORMAT"] = self.model_format

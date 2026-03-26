@@ -25,19 +25,18 @@ def main():
     temperature = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
     top_p = float(sys.argv[4]) if len(sys.argv) > 4 else 1.0
 
-    # Lazy import so we fail fast with a clear error
     try:
         from models.llama3.generation import Llama3
+        from models.datatypes import RawMessage
     except ImportError:
         print("ERROR: llama-models not installed. Install with: pip install llama-models", file=sys.stderr)
         sys.exit(1)
 
     print(f"Loading model from {MODEL_DIR} (Meta native .pth)...", file=sys.stderr)
 
-    # Llama3.build loads consolidated.XX.pth + params.json + tokenizer.model
     generator = Llama3.build(
         ckpt_dir=MODEL_DIR,
-        max_seq_len=max_tokens + 512,  # prompt + generation room
+        max_seq_len=max_tokens + 512,
         max_batch_size=1,
         world_size=1,
         device="cuda",
@@ -45,17 +44,16 @@ def main():
 
     print("Running inference...", file=sys.stderr)
 
-    # Chat completion with timing
-    messages = [{"role": "user", "content": prompt}]
+    # Build message in Meta's format: List[List[RawMessage]]
+    messages_batch = [[RawMessage(role="user", content=prompt)]]
 
     generated_tokens = 0
     first_token_time = None
     start = time.perf_counter()
 
-    full_text = ""
     for token_results in generator.chat_completion(
-        messages=messages,
-        temperature=temperature if temperature > 0 else 0.6,  # Meta requires >0
+        messages_batch=messages_batch,
+        temperature=temperature if temperature > 0 else 0.6,
         top_p=top_p,
         max_gen_len=max_tokens,
     ):
@@ -63,7 +61,6 @@ def main():
         if first_token_time is None and result.text:
             first_token_time = time.perf_counter()
         generated_tokens += 1
-        full_text += result.text
         if result.finished:
             break
 
@@ -73,7 +70,6 @@ def main():
     tokens_per_sec = generated_tokens / wall_time_s if wall_time_s > 0 else 0
     ttft_ms = (first_token_time - start) * 1000 if first_token_time else 0
 
-    # Print in the format the orchestrator expects
     print(f"Throughput: {tokens_per_sec:.2f} tokens/s")
     print(f"TTFT: {ttft_ms:.2f} ms")
     print(f"Total time: {wall_time_s:.2f} s")
