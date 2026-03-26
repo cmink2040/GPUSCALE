@@ -65,27 +65,37 @@ echo "--- Model ready ---" >&2
 echo "Model files:" >&2
 ls -lh "$MODEL_DIR"/ 2>&1 | head -20 >&2
 
-# Auto-detect model format if not set
-if [ -z "${MODEL_FORMAT:-}" ]; then
-    if ls "$MODEL_DIR"/*.gguf >/dev/null 2>&1; then
-        MODEL_FORMAT="gguf"
-    elif [ -f "$MODEL_DIR/quantize_config.json" ]; then
-        MODEL_FORMAT="gptq"
-    elif [ -f "$MODEL_DIR/config.json" ]; then
-        MODEL_FORMAT="full"
-    elif ls "$MODEL_DIR"/*.pth >/dev/null 2>&1; then
-        MODEL_FORMAT="pth"
-    else
-        MODEL_FORMAT="full"
-    fi
-    echo "Auto-detected format: $MODEL_FORMAT" >&2
-fi
+# Detect actual model format from files on disk (overrides whatever was passed)
+HAS_GGUF=false
+HAS_PTH=false
+HAS_HF=false
+ls "$MODEL_DIR"/*.gguf >/dev/null 2>&1 && HAS_GGUF=true
+ls "$MODEL_DIR"/*.pth >/dev/null 2>&1 && HAS_PTH=true
+[ -f "$MODEL_DIR/config.json" ] && HAS_HF=true
 
-# If we have .pth files and engine is vllm, switch to meta-native runner
-if [ "$MODEL_FORMAT" = "pth" ] && [ "$ENGINE" = "vllm" ]; then
-    echo "Detected Meta .pth format with vllm engine — using Meta native inference instead." >&2
-    ENGINE="meta-native"
+if [ "$HAS_GGUF" = true ]; then
+    MODEL_FORMAT="gguf"
+elif [ "$HAS_PTH" = true ]; then
+    MODEL_FORMAT="pth"
+elif [ "$HAS_HF" = true ]; then
+    MODEL_FORMAT="hf"
+elif [ -f "$MODEL_DIR/quantize_config.json" ]; then
+    MODEL_FORMAT="gptq"
 fi
+echo "Detected model format: $MODEL_FORMAT" >&2
+
+# Route engine based on what we actually have
+if [ "$HAS_PTH" = true ]; then
+    # Meta .pth files — must use meta-native (not vllm, not llama.cpp)
+    if [ "$ENGINE" != "meta-native" ]; then
+        echo "Meta .pth format detected — switching engine from $ENGINE to meta-native." >&2
+        ENGINE="meta-native"
+    fi
+elif [ "$HAS_GGUF" = true ] && [ "$ENGINE" != "llama.cpp" ]; then
+    echo "GGUF format detected — switching engine to llama.cpp." >&2
+    ENGINE="llama.cpp"
+fi
+echo "Using engine: $ENGINE" >&2
 
 # ---- Step 2: Start GPU metrics collection ----
 echo "--- Starting GPU metrics collection ---" >&2
