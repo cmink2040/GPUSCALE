@@ -5,45 +5,38 @@ on:
     branches: [main]
     paths:
       - "bench-container/**"
+      - ".github/workflows/build-bench.yml"
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: cmink2040/gpuscale-bench
 
 jobs:
-  build-and-push:
+  build-llamacpp:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/cmink2040/gpuscale-bench
           tags: |
             type=sha,prefix=
             type=raw,value=latest
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: bench-container
           file: bench-container/Dockerfile
@@ -51,5 +44,37 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=llamacpp
+          cache-to: type=gha,mode=max,scope=llamacpp
+
+  # Uncomment to build the vLLM image when ready:
+  # build-vllm:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/setup-buildx-action@v3
+  #     - uses: docker/login-action@v3
+  #       with:
+  #         registry: ${{ env.REGISTRY }}
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - id: meta
+  #       uses: docker/metadata-action@v5
+  #       with:
+  #         images: ${{ env.REGISTRY }}/cmink2040/gpuscale-bench-vllm
+  #         tags: |
+  #           type=sha,prefix=
+  #           type=raw,value=latest
+  #     - uses: docker/build-push-action@v6
+  #       with:
+  #         context: bench-container
+  #         file: bench-container/Dockerfile.vllm
+  #         platforms: linux/amd64
+  #         push: true
+  #         tags: ${{ steps.meta.outputs.tags }}
+  #         labels: ${{ steps.meta.outputs.labels }}
+  #         cache-from: type=gha,scope=vllm
+  #         cache-to: type=gha,mode=max,scope=vllm
