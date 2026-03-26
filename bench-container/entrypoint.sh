@@ -112,6 +112,8 @@ echo "--- Running benchmark ($ENGINE, $TOTAL_ITERATIONS iterations x $NUM_PROMPT
 
 ERRORS=0
 SUCCESSES=0
+ENGINE_LOG="/tmp/engine_output.txt"
+> "$ENGINE_LOG"
 
 for i in $(seq 1 "$TOTAL_ITERATIONS"); do
     if [ "$i" -le "$WARMUP_ITERATIONS" ]; then
@@ -126,9 +128,12 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
         PROMPT_LEN=${#PROMPT}
         echo "--- $ITER_LABEL, prompt $((p+1))/$NUM_PROMPTS ($PROMPT_LEN chars) ---" >&2
 
+        # Log iteration marker to engine output
+        echo "--- $ITER_LABEL, prompt $((p+1))/$NUM_PROMPTS ---" >> "$ENGINE_LOG"
+
         case "$ENGINE" in
             llama.cpp)
-                if /app/scripts/run_llama_cpp.sh "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                if /app/scripts/run_llama_cpp.sh "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P" 2>&1 | tee -a "$ENGINE_LOG"; then
                     SUCCESSES=$((SUCCESSES + 1))
                 else
                     echo "WARNING: llama.cpp failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
@@ -136,7 +141,7 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
                 fi
                 ;;
             vllm)
-                if $PY /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                if $PY /app/scripts/run_vllm.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P" 2>&1 | tee -a "$ENGINE_LOG"; then
                     SUCCESSES=$((SUCCESSES + 1))
                 else
                     echo "WARNING: vLLM failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
@@ -144,7 +149,7 @@ for i in $(seq 1 "$TOTAL_ITERATIONS"); do
                 fi
                 ;;
             meta-native)
-                if $PY /app/scripts/run_meta_native.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P"; then
+                if $PY /app/scripts/run_meta_native.py "$PROMPT" "$MAX_TOKENS" "$TEMPERATURE" "$TOP_P" 2>&1 | tee -a "$ENGINE_LOG"; then
                     SUCCESSES=$((SUCCESSES + 1))
                 else
                     echo "WARNING: Meta native failed on $ITER_LABEL prompt $((p+1)), continuing..." >&2
@@ -168,6 +173,9 @@ echo "--- Stopping GPU metrics collection ---" >&2
 # Collect all output into a result file
 RESULT_FILE="/workspace/gpuscale_result.txt"
 {
+    echo "=== ENGINE_OUTPUT_START ==="
+    cat "$ENGINE_LOG" 2>/dev/null || true
+    echo "=== ENGINE_OUTPUT_END ==="
     echo "=== GPU_METRICS_START ==="
     cat /tmp/gpu_metrics.csv 2>/dev/null || true
     echo "=== GPU_METRICS_END ==="

@@ -25,6 +25,8 @@ console = Console(stderr=True)
 # Output parsing: split engine output from GPU metrics block
 # ---------------------------------------------------------------------------
 
+ENGINE_OUTPUT_START = "=== ENGINE_OUTPUT_START ==="
+ENGINE_OUTPUT_END = "=== ENGINE_OUTPUT_END ==="
 GPU_METRICS_START = "=== GPU_METRICS_START ==="
 GPU_METRICS_END = "=== GPU_METRICS_END ==="
 
@@ -32,21 +34,33 @@ GPU_METRICS_END = "=== GPU_METRICS_END ==="
 def split_container_output(raw: str) -> tuple[str, str]:
     """Split the combined container output into engine output and GPU metrics CSV.
 
-    The container prints engine output to stdout, then between
-    ``=== GPU_METRICS_START ===`` and ``=== GPU_METRICS_END ===``
-    markers emits nvidia-smi CSV data.
+    The result file has sections delimited by markers:
+      === ENGINE_OUTPUT_START === ... === ENGINE_OUTPUT_END ===
+      === GPU_METRICS_START === ... === GPU_METRICS_END ===
 
     Returns (engine_output, gpu_metrics_csv).
     """
-    start_idx = raw.find(GPU_METRICS_START)
-    end_idx = raw.find(GPU_METRICS_END)
+    # Extract engine output
+    engine_output = ""
+    eng_start = raw.find(ENGINE_OUTPUT_START)
+    eng_end = raw.find(ENGINE_OUTPUT_END)
+    if eng_start != -1 and eng_end != -1:
+        engine_output = raw[eng_start + len(ENGINE_OUTPUT_START) : eng_end].strip()
+    else:
+        # Fallback: everything before GPU_METRICS_START is engine output
+        gpu_start = raw.find(GPU_METRICS_START)
+        if gpu_start != -1:
+            engine_output = raw[:gpu_start].rstrip()
+        else:
+            engine_output = raw
 
-    if start_idx == -1 or end_idx == -1:
-        # No metrics markers found -- entire output is engine output
-        return raw, ""
+    # Extract GPU metrics
+    gpu_csv = ""
+    gpu_start = raw.find(GPU_METRICS_START)
+    gpu_end = raw.find(GPU_METRICS_END)
+    if gpu_start != -1 and gpu_end != -1:
+        gpu_csv = raw[gpu_start + len(GPU_METRICS_START) : gpu_end].strip()
 
-    engine_output = raw[:start_idx].rstrip()
-    gpu_csv = raw[start_idx + len(GPU_METRICS_START) : end_idx].strip()
     return engine_output, gpu_csv
 
 
@@ -57,7 +71,8 @@ def _parse_engine_output(engine: InferenceEngine, output: str):
     elif engine == InferenceEngine.VLLM:
         return parse_vllm_output(output)
     else:
-        return parse_llamacpp_output(output)
+        # meta-native uses same output format as vllm (Throughput/TTFT/Total time)
+        return parse_vllm_output(output)
 
 
 # ---------------------------------------------------------------------------
