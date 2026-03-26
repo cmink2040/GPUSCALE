@@ -2,6 +2,11 @@
 # Do NOT use set -e — we handle errors per-iteration so one failure doesn't kill everything
 set -uo pipefail
 
+# Activate uv venv if it exists (created by uv sync during docker build)
+if [ -f /app/.venv/bin/activate ]; then
+    source /app/.venv/bin/activate
+fi
+
 # =============================================================================
 # GPUSCALE Benchmark Container Entrypoint
 #

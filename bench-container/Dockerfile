@@ -13,14 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # uv for fast Python installs
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Python deps — llama-models for Meta native .pth, boto3/HF for model pulling
-# cache-bust: v2
-COPY requirements.llamacpp.txt /tmp/requirements.txt
-RUN uv pip install --system --no-cache -r /tmp/requirements.txt \
-    && python3 -c "from models.llama3.generation import Llama3; print('llama-models OK')"
+# Copy project definition and sync dependencies
+COPY pyproject.toml /app/pyproject.toml
+WORKDIR /app
+RUN uv sync --no-dev --no-install-project \
+    && uv run python3 -c "from models.llama3.generation import Llama3; print('llama-models OK')"
 
 # Application code
-WORKDIR /app
 COPY entrypoint.sh /app/entrypoint.sh
 COPY scripts/ /app/scripts/
 COPY workloads/ /app/workloads/
