@@ -28,10 +28,14 @@ echo "ENGINE: ${ENGINE:?ENGINE env var is required}" >&2
 
 # Use persistent storage if available, otherwise ephemeral /models
 MODEL_DIR="/models"
-if [ -n "${VOLUME_MOUNT_PATH:-}" ] && [ -d "${VOLUME_MOUNT_PATH}" ]; then
-    MODEL_DIR="${VOLUME_MOUNT_PATH}/models/${MODEL}/${MODEL_FORMAT:-full}"
-    echo "Using persistent model dir: $MODEL_DIR" >&2
-fi
+# Check for volume mount: explicit env var, or RunPod's default /workspace, or /runpod-volume
+for CANDIDATE in "${VOLUME_MOUNT_PATH:-}" "/workspace" "/runpod-volume"; do
+    if [ -n "$CANDIDATE" ] && [ -d "$CANDIDATE" ] && [ -w "$CANDIDATE" ]; then
+        MODEL_DIR="${CANDIDATE}/models/${MODEL}/${MODEL_FORMAT:-full}"
+        echo "Using persistent model dir: $MODEL_DIR" >&2
+        break
+    fi
+done
 export MODEL_DIR
 mkdir -p "$MODEL_DIR"
 

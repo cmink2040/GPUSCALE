@@ -14,8 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Python deps — llama-models for Meta native .pth, boto3/HF for model pulling
+# cache-bust: v2
 COPY requirements.llamacpp.txt /tmp/requirements.txt
-RUN uv pip install --system --no-cache -r /tmp/requirements.txt
+RUN uv pip install --system --no-cache -r /tmp/requirements.txt \
+    && python3 -c "from models.llama3.generation import Llama3; print('llama-models OK')"
 
 # Application code
 WORKDIR /app
