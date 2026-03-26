@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -369,6 +370,60 @@ def host_info(
         console.print(f"[bold]Driver:[/bold]   {meta.gpu_driver_version}")
         console.print(f"[bold]Docker:[/bold]   {meta.docker_runtime_version}")
         console.print(f"[bold]CUDA:[/bold]     {meta.cuda_version}")
+
+
+# ---------------------------------------------------------------------------
+# RunPod volume management
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="create-volume")
+def create_volume(
+    name: Annotated[str, typer.Option(help="Volume name")] = "gpuscale-models",
+    size: Annotated[int, typer.Option(help="Size in GB")] = 50,
+    region: Annotated[str, typer.Option(help="RunPod data center ID")] = "US-TX-3",
+) -> None:
+    """Create a RunPod network volume for persistent model storage."""
+    config = JobConfig(provider=Provider.RUNPOD)
+    provider = RunPodProvider(config)
+    vol_id = provider.create_network_volume(name=name, size_gb=size, region=region)
+    console.print(f"\nAdd this to your .env:\n  [bold]RUNPOD_VOLUME_ID={vol_id}[/bold]")
+
+
+@app.command(name="sync-volume")
+def sync_volume(
+    volume_id: Annotated[str, typer.Option(
+        "--volume-id", help="RunPod volume ID (or set RUNPOD_VOLUME_ID env var)"
+    )] = "",
+) -> None:
+    """Sync models from Wasabi S3 to a RunPod network volume."""
+    vol_id = volume_id or os.environ.get("RUNPOD_VOLUME_ID", "")
+    if not vol_id:
+        console.print("[red]Volume ID required. Pass --volume-id or set RUNPOD_VOLUME_ID.[/red]")
+        raise typer.Exit(1)
+
+    config = JobConfig(provider=Provider.RUNPOD)
+    provider = RunPodProvider(config)
+    provider.sync_s3_to_volume(vol_id)
+
+
+@app.command(name="list-volumes")
+def list_volumes_cmd() -> None:
+    """List RunPod network volumes."""
+    config = JobConfig(provider=Provider.RUNPOD)
+    provider = RunPodProvider(config)
+    volumes = provider.list_volumes()
+    if not volumes:
+        console.print("[dim]No network volumes found.[/dim]")
+        return
+    table = Table(title="RunPod Network Volumes")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Size (GB)", justify="right")
+    table.add_column("Region", style="dim")
+    for v in volumes:
+        table.add_row(v["id"], v["name"], str(v.get("size", "")), v.get("dataCenterId", ""))
+    console.print(table)
 
 
 if __name__ == "__main__":
