@@ -43,10 +43,9 @@ COPY --from=builder /llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli
 COPY --from=builder /llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 
 # Install Python dependencies
-# vLLM is large — install separately so Docker layer caching helps
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
-RUN pip3 install --no-cache-dir vllm==0.7.3
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
+    && pip3 install --no-cache-dir vllm==0.7.3
 
 # Copy application code
 WORKDIR /app
