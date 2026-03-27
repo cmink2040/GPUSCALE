@@ -61,10 +61,17 @@ class RunPodProvider(BaseProvider):
 
     def provision(self) -> ProvisionedInstance:
         """Create a RunPod GPU pod with the bench image, env vars, and optional volume."""
+        from virt_runner.config import CUDA13_GPUS, DEFAULT_BENCH_IMAGE_CUDA13
+
         pc = self.config.provider_config
         gpu_type = pc.gpu_type or "NVIDIA RTX 4090"
         gpu_count = pc.gpu_count
+
+        # Auto-select CUDA 13 image for Blackwell GPUs
         image = self.config.bench_image
+        if gpu_type in CUDA13_GPUS and image == "ghcr.io/cmink2040/gpuscale-bench:latest":
+            image = DEFAULT_BENCH_IMAGE_CUDA13
+            console.print(f"[bold]Blackwell GPU detected — using CUDA 13 image[/bold]")
 
         # Build env vars for the container
         env_vars = self.config.build_container_env()
@@ -490,6 +497,12 @@ class RunPodProvider(BaseProvider):
                     logs = result["Body"].read().decode()
                     if logs:
                         console.print(f"[green]Found result: {result_key} ({len(logs)} bytes)[/green]")
+                        # Delete after retrieval so it doesn't collide with future runs
+                        try:
+                            client.delete_object(Bucket=s3.bucket, Key=result_key)
+                            console.print(f"[dim]  Cleaned up {result_key} from S3[/dim]")
+                        except Exception:
+                            pass
                         return logs
                 except client.exceptions.NoSuchKey:
                     pass

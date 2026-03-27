@@ -1,9 +1,14 @@
 # =============================================================================
 # GPUSCALE Benchmark Container — llama.cpp + Meta native inference
 # Uses prebuilt llama.cpp image — no compilation needed
+#
+# Build variants:
+#   CUDA 12.4 (default): supports P100, V100, 3090, 4090, A100, H100
+#   CUDA 13.1:           supports 3090+, 4090, 5090, A100, H100, B200
 # =============================================================================
 
-FROM ghcr.io/ggml-org/llama.cpp:light-cuda
+ARG BASE_IMAGE=ghcr.io/ggml-org/llama.cpp:light-cuda
+FROM ${BASE_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \

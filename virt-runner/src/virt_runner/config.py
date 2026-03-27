@@ -19,7 +19,11 @@ from virt_runner.models import (
 
 DEFAULT_WORKLOAD_PATH = Path(__file__).resolve().parent.parent.parent / "workloads" / "default.json"
 DEFAULT_BENCH_IMAGE = "ghcr.io/cmink2040/gpuscale-bench:latest"
+DEFAULT_BENCH_IMAGE_CUDA13 = "ghcr.io/cmink2040/gpuscale-bench:cuda13"
 DEFAULT_S3_ENDPOINT = "https://s3.wasabisys.com"
+
+# GPUs that require CUDA 13+ (Blackwell architecture)
+CUDA13_GPUS = {"NVIDIA GeForce RTX 5090", "NVIDIA RTX B200", "NVIDIA B200"}
 
 
 class ProviderConfig(BaseModel):
