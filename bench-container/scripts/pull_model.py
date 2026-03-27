@@ -83,14 +83,34 @@ def pull_from_huggingface():
 
     if MODEL_FORMAT == "gguf" and GGUF_QUANT:
         repo_id = os.environ.get("HF_REPO_ID", MODEL)
-        filename = f"{GGUF_QUANT}.gguf"
-        print(f"Pulling GGUF from HF: {repo_id}/{filename}", file=sys.stderr)
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            local_dir=MODEL_DIR,
-            token=token,
-        )
+        # Extract model short name for filename patterns (e.g. "Qwen3.5-9B" from "Qwen/Qwen3.5-9B")
+        model_short = MODEL.split("/")[-1] if "/" in MODEL else MODEL
+        # Try multiple filename patterns used by different GGUF providers
+        candidates = [
+            f"{model_short}-{GGUF_QUANT}.gguf",       # bartowski: Qwen3.5-9B-Q4_K_M.gguf
+            f"{GGUF_QUANT}.gguf",                       # bare: Q4_K_M.gguf
+            f"{model_short.lower()}-{GGUF_QUANT.lower()}.gguf",
+        ]
+        downloaded = False
+        for filename in candidates:
+            try:
+                print(f"Pulling GGUF from HF: {repo_id}/{filename}", file=sys.stderr)
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    local_dir=MODEL_DIR,
+                    token=token,
+                )
+                downloaded = True
+                print(f"Downloaded: {filename}", file=sys.stderr)
+                break
+            except Exception as e:
+                print(f"  Not found: {filename}", file=sys.stderr)
+                continue
+        if not downloaded:
+            print(f"ERROR: Could not find GGUF file for {GGUF_QUANT} in {repo_id}", file=sys.stderr)
+            print(f"Tried: {candidates}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(f"Pulling from HF: {MODEL}", file=sys.stderr)
         snapshot_download(
