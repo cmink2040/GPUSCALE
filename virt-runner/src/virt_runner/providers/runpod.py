@@ -74,6 +74,9 @@ class RunPodProvider(BaseProvider):
             env_vars["VOLUME_MOUNT_PATH"] = VOLUME_MOUNT_PATH
             console.print(f"[bold]Attaching network volume {self.volume_id}[/bold]")
 
+        # Store run ID for S3 result polling
+        self._run_id = env_vars.get("GPUSCALE_RUN_ID", "")
+
         # RunPod expects env as [{key: "K", value: "V"}, ...]
         env_list = [{"key": k, "value": v} for k, v in env_vars.items()]
 
@@ -167,6 +170,11 @@ class RunPodProvider(BaseProvider):
         )
 
         console.print(f"[green]Created pod {pod_id} ({gpu_display})[/green]")
+
+        # Store pod_id so the container can use it in the S3 result key
+        # We need to update the env vars on the already-created pod — not possible.
+        # Instead, store it for the poller to use.
+        self._current_pod_id = pod_id
 
         gpus = [GPUInfo(index=i, name=gpu_display) for i in range(gpu_count)]
 
@@ -433,8 +441,9 @@ class RunPodProvider(BaseProvider):
     def _fetch_logs(self, pod_id: str) -> str:
         """Fetch benchmark results from S3.
 
-        The container uploads results to s3://<bucket>/results/<hostname>_<timestamp>.txt
-        We poll S3 for new result files until one appears.
+        The container uploads results to s3://<bucket>/results/<run_id>.txt
+        where run_id is the unique GPUSCALE_RUN_ID passed via env var.
+        We poll for that exact key.
         """
         import boto3
 
@@ -443,7 +452,8 @@ class RunPodProvider(BaseProvider):
             console.print("[red]No S3 config — cannot retrieve results.[/red]")
             return ""
 
-        console.print(f"[bold]Waiting for results in s3://{s3.bucket}/results/...[/bold]")
+        run_id = getattr(self, "_run_id", "")
+        result_key = f"results/{run_id}.txt" if run_id else ""
 
         client = boto3.client(
             "s3",
@@ -453,19 +463,14 @@ class RunPodProvider(BaseProvider):
             region_name=os.getenv("WASABI_REGION", "us-east-1"),
         )
 
-        # Record existing result files so we can detect new ones
-        existing_keys: set[str] = set()
-        try:
-            resp = client.list_objects_v2(Bucket=s3.bucket, Prefix="results/")
-            for obj in resp.get("Contents", []):
-                existing_keys.add(obj["Key"])
-        except Exception:
-            pass
+        if result_key:
+            console.print(f"[bold]Waiting for s3://{s3.bucket}/{result_key}...[/bold]")
+        else:
+            console.print(f"[bold]Waiting for results in s3://{s3.bucket}/results/...[/bold]")
 
-        # Poll for new result files
         deadline = time.time() + 1800
         while time.time() < deadline:
-            # Also check if pod is still alive
+            # Check pod status
             try:
                 data = self._graphql(
                     'query { pod(input: {podId: "%s"}) { id desiredStatus runtime { uptimeInSeconds } } }' % pod_id
@@ -478,19 +483,18 @@ class RunPodProvider(BaseProvider):
             except Exception:
                 pass
 
-            # Check for new result files
-            try:
-                resp = client.list_objects_v2(Bucket=s3.bucket, Prefix="results/")
-                for obj in resp.get("Contents", []):
-                    if obj["Key"] not in existing_keys:
-                        # New result file found
-                        console.print(f"[green]Found result: {obj['Key']}[/green]")
-                        result = client.get_object(Bucket=s3.bucket, Key=obj["Key"])
-                        logs = result["Body"].read().decode()
-                        console.print(f"[green]Retrieved {len(logs)} bytes of results from S3.[/green]")
+            # Try to fetch the exact result key
+            if result_key:
+                try:
+                    result = client.get_object(Bucket=s3.bucket, Key=result_key)
+                    logs = result["Body"].read().decode()
+                    if logs:
+                        console.print(f"[green]Found result: {result_key} ({len(logs)} bytes)[/green]")
                         return logs
-            except Exception as exc:
-                console.print(f"[dim]  S3 poll error: {exc}[/dim]")
+                except client.exceptions.NoSuchKey:
+                    pass
+                except Exception as exc:
+                    console.print(f"[dim]  S3 poll error: {exc}[/dim]")
 
             time.sleep(15)
 

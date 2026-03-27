@@ -111,6 +111,11 @@ class JobConfig(BaseModel):
         """Build the full set of environment variables for the bench container."""
         env: dict[str, str] = {}
 
+        import uuid as _uuid
+
+        # Unique run ID — used in S3 result key to prevent collisions
+        env["GPUSCALE_RUN_ID"] = _uuid.uuid4().hex[:12]
+
         # Required
         env["MODEL"] = self.model
         env["ENGINE"] = self.engine.value

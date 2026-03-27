@@ -191,7 +191,9 @@ RESULT_FILE="/workspace/gpuscale_result.txt"
 cat "$RESULT_FILE" 2>/dev/null || true
 
 # Upload results to S3 so the orchestrator can retrieve them without SSH
-RESULT_S3_KEY="results/${HOSTNAME:-unknown}_$(date +%s).txt"
+# Unique key: GPUSCALE_RUN_ID (set by orchestrator) > RUNPOD_POD_ID > HOSTNAME
+RUN_ID="${GPUSCALE_RUN_ID:-${RUNPOD_POD_ID:-${HOSTNAME:-unknown}}}"
+RESULT_S3_KEY="results/${RUN_ID}.txt"
 echo "--- Uploading results to S3: s3://${S3_BUCKET:-}/${RESULT_S3_KEY} ---" >&2
 $PY -c "
 import os, boto3

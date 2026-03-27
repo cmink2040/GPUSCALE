@@ -234,7 +234,8 @@ def _split_iterations(engine_output: str, workload: WorkloadConfig) -> list[str]
     We split on those markers and return one string per iteration.
     """
     # Match both warmup and real iteration markers from entrypoint.sh
-    pattern = r"---\s+(?:Warmup iteration|Iteration)\s+\d+/\d+\s+---"
+    # Format: "--- Iteration 1/3, prompt 1/3 ---" or "--- Warmup iteration 1/1, prompt 1/3 ---"
+    pattern = r"---\s+(?:Warmup iteration|Iteration)\s+\d+/\d+.*?---"
     parts = re.split(pattern, engine_output)
 
     # The first element is anything before the first marker (container boot logs)
