@@ -60,6 +60,99 @@ class RunPodProvider(BaseProvider):
         return data.get("data", {})
 
     def provision(self) -> ProvisionedInstance:
+        """Create a RunPod GPU pod. Routes to vLLM pod if engine is vllm + HF model."""
+        from virt_runner.models import InferenceEngine
+
+        if self.config.engine == InferenceEngine.VLLM and self.config.model_format != "pth":
+            return self._provision_vllm()
+        return self._provision_bench()
+
+    def _provision_vllm(self) -> ProvisionedInstance:
+        """Deploy vllm/vllm-openai pod, SSH in, curl-bash the benchmark script."""
+        pc = self.config.provider_config
+        gpu_type = pc.gpu_type or "NVIDIA GeForce RTX 4090"
+        gpu_count = pc.gpu_count
+
+        # Build env vars — S3 creds for result upload + model config
+        env_vars = self.config.build_container_env()
+        self._run_id = env_vars.get("GPUSCALE_RUN_ID", "")
+
+        env_list = [{"key": k, "value": v} for k, v in env_vars.items()]
+
+        console.print(f"[bold]Creating vLLM pod: {gpu_count}x {gpu_type}...[/bold]")
+        console.print(f"[dim]Image: vllm/vllm-openai:latest[/dim]")
+        console.print(f"[dim]Model: {self.config.model}[/dim]")
+
+        mutation = """
+        mutation createPod($input: PodFindAndDeployOnDemandInput!) {
+            podFindAndDeployOnDemand(input: $input) {
+                id
+                name
+                gpuCount
+                machine { gpuDisplayName }
+            }
+        }
+        """
+        pod_input: dict = {
+            "name": f"gpuscale-vllm-{gpu_type.replace(' ', '-').lower()}",
+            "imageName": "vllm/vllm-openai:latest",
+            "templateId": "iqilnw0ymf",  # RunPod vLLM template (pre-cached image)
+            "gpuTypeId": gpu_type,
+            "gpuCount": gpu_count,
+            "containerDiskInGb": 60,
+            "volumeInGb": 50,
+            "volumeMountPath": "/workspace",
+            "startSsh": True,
+            "env": env_list,
+            "dockerArgs": self.config.model,  # becomes: vllm serve Qwen/Qwen3.5-9B
+        }
+
+        # Try requested GPU, then fallbacks
+        gpu_fallbacks = [
+            gpu_type, "NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090",
+            "NVIDIA RTX A6000", "NVIDIA GeForce RTX 4090",
+        ]
+        seen = set()
+        gpu_fallbacks = [g for g in gpu_fallbacks if not (g in seen or seen.add(g))]
+
+        pod = {}
+        for try_gpu in gpu_fallbacks:
+            try:
+                pod_input["gpuTypeId"] = try_gpu
+                pod_input["name"] = f"gpuscale-vllm-{try_gpu.replace(' ', '-').lower()}"
+                console.print(f"[dim]Trying {try_gpu}...[/dim]")
+                data = self._graphql(mutation, {"input": pod_input})
+                pod = data.get("podFindAndDeployOnDemand", {})
+                if pod.get("id"):
+                    gpu_type = try_gpu
+                    break
+            except RuntimeError as e:
+                if "SUPPLY_CONSTRAINT" in str(e) or "does not have the resources" in str(e):
+                    console.print(f"[dim]  No supply for {try_gpu}[/dim]")
+                    continue
+                raise
+
+        pod_id = pod.get("id", "")
+        if not pod_id:
+            raise RuntimeError("No GPU available for vLLM pod.")
+
+        gpu_display = pod.get("machine", {}).get("gpuDisplayName", gpu_type) if pod.get("machine") else gpu_type
+        console.print(f"[green]Created vLLM pod {pod_id} ({gpu_display})[/green]")
+
+        gpus = [GPUInfo(index=i, name=gpu_display) for i in range(gpu_count)]
+
+        instance = ProvisionedInstance(
+            instance_id=pod_id,
+            gpus=gpus,
+            extra={
+                "gpu_name": gpu_display,
+                "gpu_count": gpu_count,
+                "mode": "vllm_ssh",
+            },
+        )
+        return instance
+
+    def _provision_bench(self) -> ProvisionedInstance:
         """Create a RunPod GPU pod with the bench image, env vars, and optional volume."""
         from virt_runner.config import CUDA13_GPUS, DEFAULT_BENCH_IMAGE_CUDA13
 
@@ -196,12 +289,7 @@ class RunPodProvider(BaseProvider):
         )
 
     def wait_ready(self, instance: ProvisionedInstance, timeout_s: int = 1800) -> bool:
-        """Wait for the container to start, then SSH in to retrieve results.
-
-        The container runs the benchmark and writes results to /workspace/gpuscale_result.txt,
-        then stays alive so we can SSH in. We poll until the container is running,
-        then use _fetch_logs (which SSHes in) to get the results.
-        """
+        """Wait for pod to start, run benchmark (SSH if vLLM mode), poll S3 for results."""
         console.print(
             f"[bold]Waiting for pod {instance.instance_id} "
             f"to start (timeout {timeout_s}s)...[/bold]"
@@ -240,7 +328,7 @@ class RunPodProvider(BaseProvider):
 
             if runtime is not None:
                 uptime = runtime.get("uptimeInSeconds", 0)
-                console.print(f"  Container running (uptime: {uptime}s). Polling S3 for results...")
+                console.print(f"  Container running (uptime: {uptime}s)")
                 break
             else:
                 console.print(f"  Pod status: [cyan]{status}[/cyan] (waiting for container to start)")
@@ -249,7 +337,14 @@ class RunPodProvider(BaseProvider):
             console.print("[red]Timeout waiting for container to start.[/red]")
             return False
 
-        # Phase 2: SSH in and wait for benchmark to finish, then get results
+        # Phase 2: If vLLM SSH mode, SSH in and run the benchmark script
+        if instance.extra.get("mode") == "vllm_ssh":
+            console.print("[bold]Waiting for SSH to be ready...[/bold]")
+            time.sleep(60)  # vLLM template needs time to start SSH daemon
+            if not self._ssh_run_vllm_bench(instance.instance_id):
+                console.print("[yellow]SSH benchmark may have failed, checking S3 anyway...[/yellow]")
+
+        # Phase 3: Poll S3 for results
         logs = self._fetch_logs(instance.instance_id)
         if logs:
             instance.extra["logs"] = logs
@@ -444,6 +539,72 @@ class RunPodProvider(BaseProvider):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _ssh_run_vllm_bench(self, pod_id: str) -> bool:
+        """SSH into a RunPod pod and curl-bash the vLLM benchmark script."""
+        import paramiko
+
+        proxy_host = f"{pod_id}-ssh.proxy.runpod.io"
+        ssh_key_path = os.path.expanduser("~/.ssh/id_ed25519")
+
+        console.print(f"[dim]SSH: root@{proxy_host}[/dim]")
+
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            key = None
+            if os.path.exists(ssh_key_path):
+                key = paramiko.Ed25519Key.from_private_key_file(ssh_key_path)
+
+            # Retry SSH connection — vLLM template needs time to start SSH daemon
+            connected = False
+            for attempt in range(12):
+                try:
+                    client.connect(proxy_host, port=22, username="root", pkey=key, timeout=30)
+                    connected = True
+                    break
+                except Exception as e:
+                    console.print(f"[dim]  SSH attempt {attempt+1}/12: {e}[/dim]")
+                    time.sleep(15)
+
+            if not connected:
+                console.print("[red]Could not SSH into pod.[/red]")
+                return False
+
+            console.print("[green]SSH connected. Running benchmark...[/green]")
+
+            # Build the env export string for the benchmark script
+            env_vars = self.config.build_container_env()
+            env_exports = " ".join(f'{k}="{v}"' for k, v in env_vars.items())
+
+            # curl-bash the script with env vars
+            script_url = "https://raw.githubusercontent.com/cmink2040/GPUSCALE/main/bench-container/bench-vllm.sh"
+            cmd = f'export {env_exports} && curl -sL {script_url} | bash'
+
+            console.print(f"[dim]Running: curl | bash with {len(env_vars)} env vars[/dim]")
+
+            _, stdout, stderr = client.exec_command(cmd, timeout=1800)
+
+            # Stream output
+            while True:
+                line = stdout.readline()
+                if not line:
+                    break
+                console.print(f"[dim]  {line.rstrip()}[/dim]")
+
+            exit_code = stdout.channel.recv_exit_status()
+            if exit_code != 0:
+                err = stderr.read().decode()
+                console.print(f"[red]Script exited with code {exit_code}[/red]")
+                console.print(f"[dim]{err[-500:]}[/dim]")
+
+            client.close()
+            return exit_code == 0
+
+        except Exception as exc:
+            console.print(f"[red]SSH execution failed: {exc}[/red]")
+            return False
 
     def _fetch_logs(self, pod_id: str) -> str:
         """Fetch benchmark results from S3.
