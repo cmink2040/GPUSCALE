@@ -90,6 +90,7 @@ for i in $(seq 1 "$TOTAL"); do
         RESPONSE=$(curl -s -w '\n%{time_starttransfer}' \
             "$VLLM_URL/v1/chat/completions" \
             -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${VLLM_API_KEY:-}" \
             -d "{
                 \"model\": \"$MODEL_NAME\",
                 \"messages\": [{\"role\": \"user\", \"content\": $(python3 -c "import json; print(json.dumps('$PROMPT'))")}],

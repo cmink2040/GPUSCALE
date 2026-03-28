@@ -93,24 +93,41 @@ class RunPodProvider(BaseProvider):
             }
         }
         """
+        # Use "vLLM Latest" template (pvcdqlwm9r) — pre-cached image on RunPod
+        # dockerArgs format: MODEL_NAME --flags (model is first positional arg to vllm serve)
+        # Note: this template requires Data Center GPUs (CUDA Forward Compatibility)
+        vllm_api_key = "gpuscale-bench"
+        vllm_args = (
+            f"{self.config.model} "
+            f"--host 0.0.0.0 --port 8000 "
+            f"--dtype auto "
+            f"--enforce-eager "
+            f"--gpu-memory-utilization 0.95 "
+            f"--max-model-len 4096 "
+            f"--api-key {vllm_api_key}"
+        )
+        # Pass the API key so bench-vllm.sh can use it
+        env_vars["VLLM_API_KEY"] = vllm_api_key
+
         pod_input: dict = {
             "name": f"gpuscale-vllm-{gpu_type.replace(' ', '-').lower()}",
-            "imageName": "vllm/vllm-openai:latest",
-            "templateId": "iqilnw0ymf",  # RunPod vLLM template (pre-cached image)
+            "templateId": "pvcdqlwm9r",  # "vLLM Latest" template
             "gpuTypeId": gpu_type,
             "gpuCount": gpu_count,
-            "containerDiskInGb": 60,
+            "containerDiskInGb": 40,
             "volumeInGb": 50,
             "volumeMountPath": "/workspace",
             "startSsh": True,
             "env": env_list,
-            "dockerArgs": self.config.model,  # becomes: vllm serve Qwen/Qwen3.5-9B
+            "dockerArgs": vllm_args,
         }
 
         # Try requested GPU, then fallbacks
+        # vLLM Latest template requires Data Center GPUs (CUDA Forward Compatibility)
         gpu_fallbacks = [
-            gpu_type, "NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090",
-            "NVIDIA RTX A6000", "NVIDIA GeForce RTX 4090",
+            gpu_type, "NVIDIA RTX A5000", "NVIDIA RTX A6000",
+            "NVIDIA RTX A4000", "NVIDIA RTX A4500",
+            "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090",
         ]
         seen = set()
         gpu_fallbacks = [g for g in gpu_fallbacks if not (g in seen or seen.add(g))]
@@ -544,10 +561,22 @@ class RunPodProvider(BaseProvider):
         """SSH into a RunPod pod and curl-bash the vLLM benchmark script."""
         import paramiko
 
-        proxy_host = f"{pod_id}-ssh.proxy.runpod.io"
-        ssh_key_path = os.path.expanduser("~/.ssh/id_ed25519")
+        # Get the SSH connection info from RunPod API
+        # RunPod SSH format: {pod_id}-{machine_id}@ssh.runpod.io
+        ssh_host = "ssh.runpod.io"
+        ssh_user = pod_id  # default, will try to get full user from API
+        try:
+            data = self._graphql(
+                'query { pod(input: {podId: "%s"}) { machine { podHostId } } }' % pod_id
+            )
+            pod = data.get("pod")
+            if pod and pod.get("machine", {}).get("podHostId"):
+                ssh_user = pod["machine"]["podHostId"]  # already includes pod_id-machine_id
+        except Exception:
+            pass
 
-        console.print(f"[dim]SSH: root@{proxy_host}[/dim]")
+        ssh_key_path = os.path.expanduser("~/.ssh/id_ed25519")
+        console.print(f"[dim]SSH: {ssh_user}@{ssh_host}[/dim]")
 
         try:
             client = paramiko.SSHClient()
@@ -561,7 +590,7 @@ class RunPodProvider(BaseProvider):
             connected = False
             for attempt in range(12):
                 try:
-                    client.connect(proxy_host, port=22, username="root", pkey=key, timeout=30)
+                    client.connect(ssh_host, port=22, username=ssh_user, pkey=key, timeout=30)
                     connected = True
                     break
                 except Exception as e:
@@ -574,33 +603,67 @@ class RunPodProvider(BaseProvider):
 
             console.print("[green]SSH connected. Running benchmark...[/green]")
 
-            # Build the env export string for the benchmark script
+            # Build env exports — only safe vars (no WORKLOAD_CONFIG which has special chars)
             env_vars = self.config.build_container_env()
-            env_exports = " ".join(f'{k}="{v}"' for k, v in env_vars.items())
+            safe_keys = [
+                "MODEL", "ENGINE", "GPUSCALE_RUN_ID", "MODEL_FORMAT", "GGUF_QUANT",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_ENDPOINT",
+                "S3_BUCKET", "S3_MODEL_KEY", "AWS_DEFAULT_REGION",
+                "RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+                "MAX_TOKENS", "ITERATIONS", "WARMUP", "HF_TOKEN",
+                "VLLM_API_KEY",
+            ]
+            export_parts = []
+            for k in safe_keys:
+                if k in env_vars:
+                    v = env_vars[k].replace("'", "'\\''")
+                    export_parts.append(f"export {k}='{v}'")
+            env_cmd = " && ".join(export_parts)
 
-            # curl-bash the script with env vars
             script_url = "https://raw.githubusercontent.com/cmink2040/GPUSCALE/main/bench-container/bench-vllm.sh"
-            cmd = f'export {env_exports} && curl -sL {script_url} | bash'
+            cmd = f"{env_cmd} && curl -sL {script_url} | bash"
 
             console.print(f"[dim]Running: curl | bash with {len(env_vars)} env vars[/dim]")
 
-            _, stdout, stderr = client.exec_command(cmd, timeout=1800)
+            # RunPod SSH proxy requires a PTY — send command via stdin
+            channel = client.get_transport().open_session()
+            channel.get_pty(width=200, height=50)
+            channel.settimeout(1800)
+            channel.invoke_shell()
+
+            import socket
+
+            # Wait for shell prompt
+            time.sleep(3)
+            # Drain the welcome message
+            while channel.recv_ready():
+                channel.recv(4096)
+
+            # Send the command via stdin
+            channel.sendall(f"{cmd}\nexit\n".encode())
 
             # Stream output
+            output_lines = []
             while True:
-                line = stdout.readline()
-                if not line:
+                try:
+                    data = channel.recv(4096)
+                    if not data:
+                        break
+                    for line in data.decode(errors="replace").splitlines():
+                        # Filter out ANSI escape codes and shell prompt noise
+                        clean = line.strip()
+                        if clean and not clean.startswith("[?") and not clean.startswith("]0;"):
+                            console.print(f"[dim]  {clean}[/dim]")
+                except socket.timeout:
                     break
-                console.print(f"[dim]  {line.rstrip()}[/dim]")
 
-            exit_code = stdout.channel.recv_exit_status()
+            exit_code = channel.recv_exit_status()
             if exit_code != 0:
-                err = stderr.read().decode()
-                console.print(f"[red]Script exited with code {exit_code}[/red]")
-                console.print(f"[dim]{err[-500:]}[/dim]")
+                console.print(f"[yellow]Shell exited with code {exit_code}[/yellow]")
 
+            channel.close()
             client.close()
-            return exit_code == 0
+            return True  # Script ran, check S3 for results
 
         except Exception as exc:
             console.print(f"[red]SSH execution failed: {exc}[/red]")
