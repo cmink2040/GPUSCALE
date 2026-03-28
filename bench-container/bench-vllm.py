@@ -30,60 +30,121 @@ GPU_METRICS = "/tmp/gpuscale_gpu.csv"
 
 
 def wait_for_server():
-    """Wait for vLLM server to be ready."""
+    """Wait for vLLM server to be ready, reporting status along the way."""
+    import urllib.request
+    import urllib.error
+
     print("Waiting for vLLM server...", file=sys.stderr)
-    for i in range(120):
+    start = time.time()
+
+    while time.time() - start < 1800:  # 30 min max
+        elapsed = int(time.time() - start)
+
+        # Try the health/models endpoint
         try:
-            import urllib.request
             req = urllib.request.Request(f"{VLLM_URL}/v1/models")
             if VLLM_API_KEY:
                 req.add_header("Authorization", f"Bearer {VLLM_API_KEY}")
             resp = urllib.request.urlopen(req, timeout=5)
             data = json.loads(resp.read())
             model_name = data["data"][0]["id"]
-            print(f"vLLM ready. Model: {model_name}", file=sys.stderr)
+            print(f"vLLM ready after {elapsed}s. Model: {model_name}", file=sys.stderr)
             return model_name
-        except Exception:
-            if i % 12 == 0:
-                print(f"  Waiting... ({i*5}s)", file=sys.stderr)
-            time.sleep(5)
-    print("FATAL: vLLM server not ready after 10 minutes.", file=sys.stderr)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print(f"  [{elapsed}s] Server up but auth failed (401). Check VLLM_API_KEY.", file=sys.stderr)
+            elif e.code == 503:
+                print(f"  [{elapsed}s] Server loading model (503)...", file=sys.stderr)
+            else:
+                print(f"  [{elapsed}s] Server returned {e.code}.", file=sys.stderr)
+        except urllib.error.URLError:
+            # Server not up yet — check if process is running
+            try:
+                import subprocess
+                ps = subprocess.run(["pgrep", "-f", "vllm"], capture_output=True)
+                if ps.returncode == 0:
+                    print(f"  [{elapsed}s] vLLM process running, server not ready yet...", file=sys.stderr)
+                else:
+                    print(f"  [{elapsed}s] No vLLM process found. Waiting for startup...", file=sys.stderr)
+            except Exception:
+                print(f"  [{elapsed}s] Server not reachable...", file=sys.stderr)
+        except Exception as e:
+            print(f"  [{elapsed}s] {type(e).__name__}: {e}", file=sys.stderr)
+
+        time.sleep(5)
+
+    print("FATAL: vLLM server not ready after 30 minutes.", file=sys.stderr)
     sys.exit(1)
 
 
 def call_vllm(model_name, prompt):
-    """Make a chat completion request and return (tokens, wall_time_s, ttft_s)."""
-    import urllib.request
+    """Make a streaming chat completion request and return (tokens, wall_time_s, ttft_s)."""
+    import http.client
+    from urllib.parse import urlparse
 
     payload = json.dumps({
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS,
         "temperature": 0.01,
-        "stream": False,
+        "stream": True,
     }).encode()
 
-    req = urllib.request.Request(
-        f"{VLLM_URL}/v1/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {VLLM_API_KEY}" if VLLM_API_KEY else "",
-        },
-    )
+    parsed = urlparse(VLLM_URL)
+    host = parsed.hostname
+    port = parsed.port or 8000
 
     start = time.perf_counter()
+    ttft = 0.0
+    tokens = 0
+
     try:
-        resp = urllib.request.urlopen(req, timeout=300)
-        data = json.loads(resp.read())
+        conn = http.client.HTTPConnection(host, port, timeout=300)
+        headers = {"Content-Type": "application/json"}
+        if VLLM_API_KEY:
+            headers["Authorization"] = f"Bearer {VLLM_API_KEY}"
+
+        conn.request("POST", "/v1/chat/completions", body=payload, headers=headers)
+        resp = conn.getresponse()
+
+        if resp.status != 200:
+            body = resp.read().decode()
+            print(f"  Request failed: {resp.status} {body[:200]}", file=sys.stderr)
+            return 0, 0, 0
+
+        # Read SSE stream
+        first_content = True
+        for raw_line in resp:
+            line = raw_line.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                if content and first_content:
+                    ttft = time.perf_counter() - start
+                    first_content = False
+                # Count completion tokens from usage if available in final chunk
+                usage = chunk.get("usage")
+                if usage and usage.get("completion_tokens"):
+                    tokens = usage["completion_tokens"]
+                elif content:
+                    tokens += 1  # approximate: count content chunks as tokens
+            except json.JSONDecodeError:
+                continue
+
+        conn.close()
     except Exception as e:
         print(f"  Request failed: {e}", file=sys.stderr)
         return 0, 0, 0
-    end = time.perf_counter()
 
-    tokens = data.get("usage", {}).get("completion_tokens", 0)
+    end = time.perf_counter()
     wall = end - start
-    return tokens, wall, 0  # TTFT not available from non-streaming
+    return tokens, wall, ttft
 
 
 def main():

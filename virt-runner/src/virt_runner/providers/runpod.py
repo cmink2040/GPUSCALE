@@ -605,6 +605,8 @@ class RunPodProvider(BaseProvider):
 
             # Build env exports — only safe vars (no WORKLOAD_CONFIG which has special chars)
             env_vars = self.config.build_container_env()
+            # Add vLLM API key (set during provision, not in build_container_env)
+            env_vars["VLLM_API_KEY"] = "gpuscale-bench"
             safe_keys = [
                 "MODEL", "ENGINE", "GPUSCALE_RUN_ID", "MODEL_FORMAT", "GGUF_QUANT",
                 "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_ENDPOINT",
