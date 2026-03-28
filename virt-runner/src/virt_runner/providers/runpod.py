@@ -620,8 +620,8 @@ class RunPodProvider(BaseProvider):
                     export_parts.append(f"export {k}='{v}'")
             env_cmd = " && ".join(export_parts)
 
-            script_url = "https://raw.githubusercontent.com/cmink2040/GPUSCALE/main/bench-container/bench-vllm.sh"
-            cmd = f"{env_cmd} && curl -sL {script_url} | bash"
+            script_url = "https://raw.githubusercontent.com/cmink2040/GPUSCALE/main/bench-container/bench-vllm.py"
+            cmd = f"{env_cmd} && curl -sL {script_url} | python3"
 
             console.print(f"[dim]Running: curl | bash with {len(env_vars)} env vars[/dim]")
 
