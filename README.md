@@ -1,8 +1,6 @@
 # GPUSCALE
 
-Public, open benchmark for LLM inference on GPUs — local hardware and cloud rental (Vast.ai, RunPod). Think [Blender Open Data](https://opendata.blender.org/), but for LLM workloads.
-
-The goal is to produce comparable, reproducible performance data so users can make informed decisions when purchasing or renting GPUs at scale.
+We are running and maintaining a full benchmark suite for AI-related GPU tasks. These are to showcase GPU performance similar to Blender Open Data to inform AI providers and researchers when purchasing or renting GPUs at scale, as well as maintaining a reference for future accelerators.
 
 ## Architecture
 
