@@ -81,6 +81,7 @@ class JobConfig(BaseModel):
     ssh_user: str = "root"
     timeout_s: int = 1800  # 30 min default
     hf_token: str = ""
+    no_docker: bool = False  # If True and provider=local, run bench scripts directly on host
 
     @model_validator(mode="after")
     def _fill_from_env(self) -> "JobConfig":

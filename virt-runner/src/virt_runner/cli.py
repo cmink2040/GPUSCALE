@@ -58,9 +58,10 @@ def _build_dbops_payload(result: BenchmarkResult, config: JobConfig) -> dict:
     agg = result.aggregate
 
     # Map provider names to what the DB constraint expects
+    is_community = config.provider_config.extra.get("community", False)
     provider_map = {
         "local": "local",
-        "vast": "vast.ai",
+        "vast": "vast.ai (community)" if is_community else "vast.ai",
         "runpod": "runpod",
     }
     db_provider = provider_map.get(result.provider.value, result.provider.value)
@@ -222,6 +223,13 @@ def run(
     submit: Annotated[bool, typer.Option(
         "--submit", help="Submit results to the database via dbops"
     )] = False,
+    community: Annotated[bool, typer.Option(
+        "--community", help="Use community cloud instead of datacenter (Vast.ai)"
+    )] = False,
+    no_docker: Annotated[bool, typer.Option(
+        "--no-docker",
+        help="Local only: run bench-container scripts directly on the host instead of via Docker.",
+    )] = False,
 ) -> None:
     """Run a GPU benchmark job."""
     config = JobConfig(
@@ -232,9 +240,13 @@ def run(
         gguf_quant=gguf_quant,
         bench_image=bench_image,
         timeout_s=timeout,
+        no_docker=no_docker,
     )
+    if no_docker and provider != Provider.LOCAL:
+        raise typer.BadParameter("--no-docker is only supported with --provider local")
     config.provider_config.gpu_type = gpu_type
     config.provider_config.gpu_count = gpu_count
+    config.provider_config.extra["community"] = community
 
     workload = config.load_workload(workload_file)
 
