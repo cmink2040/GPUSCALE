@@ -23,9 +23,11 @@ echo "Using model: $GGUF_FILE" >&2
 
 # Run llama.cpp inference
 # -ngl 999: offload all layers to GPU
+# -no-cnv: force one-shot mode. Recent llama-cli builds auto-enable
+#   conversation mode when the model ships a chat template (e.g. Llama-3.1
+#   Instruct), which drops into an interactive REPL and blocks forever on
+#   stdin. We want a single generate-then-exit run.
 # --no-display-prompt: don't echo the prompt back
-# The timing output goes to stderr (llama_print_timings)
-# which the orchestrator's regex parser expects
 llama-cli \
     -m "$GGUF_FILE" \
     -p "$PROMPT" \
@@ -33,5 +35,6 @@ llama-cli \
     --temp "$TEMPERATURE" \
     --top-p "$TOP_P" \
     -ngl 999 \
+    -no-cnv \
     --no-display-prompt \
-    2>&1
+    </dev/null 2>&1

@@ -150,6 +150,20 @@ def parse_llamacpp_output(output: str) -> EngineTimings:
     if total_match:
         timings.wall_time_s = float(total_match.group(1)) / 1000.0
 
+    # Recent llama-cli builds (b8000+) replaced llama_print_timings with a
+    # compact single-line summary:
+    #   [ Prompt: 87.7 t/s | Generation: 39.0 t/s ]
+    # Populate whatever we didn't already get from the legacy format.
+    compact_match = re.search(
+        r"\[\s*Prompt:\s*([\d.]+)\s*t/s\s*\|\s*Generation:\s*([\d.]+)\s*t/s\s*\]",
+        output,
+    )
+    if compact_match:
+        if timings.prompt_eval_rate_tokens_per_sec == 0.0:
+            timings.prompt_eval_rate_tokens_per_sec = float(compact_match.group(1))
+        if timings.tokens_per_sec == 0.0:
+            timings.tokens_per_sec = float(compact_match.group(2))
+
     return timings
 
 
