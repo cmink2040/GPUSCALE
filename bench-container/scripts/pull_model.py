@@ -77,40 +77,53 @@ def pull_from_s3():
 
 def pull_from_huggingface():
     """Download model from HuggingFace Hub."""
-    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
 
     token = os.environ.get("HF_TOKEN")
 
     if MODEL_FORMAT == "gguf" and GGUF_QUANT:
         repo_id = os.environ.get("HF_REPO_ID", MODEL)
-        # Extract model short name for filename patterns (e.g. "Qwen3.5-9B" from "Qwen/Qwen3.5-9B")
-        model_short = MODEL.split("/")[-1] if "/" in MODEL else MODEL
-        # Try multiple filename patterns used by different GGUF providers
-        candidates = [
-            f"{model_short}-{GGUF_QUANT}.gguf",       # bartowski: Qwen3.5-9B-Q4_K_M.gguf
-            f"{GGUF_QUANT}.gguf",                       # bare: Q4_K_M.gguf
-            f"{model_short.lower()}-{GGUF_QUANT.lower()}.gguf",
-        ]
-        downloaded = False
-        for filename in candidates:
-            try:
-                print(f"Pulling GGUF from HF: {repo_id}/{filename}", file=sys.stderr)
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    local_dir=MODEL_DIR,
-                    token=token,
-                )
-                downloaded = True
-                print(f"Downloaded: {filename}", file=sys.stderr)
-                break
-            except Exception as e:
-                print(f"  Not found: {filename}", file=sys.stderr)
-                continue
-        if not downloaded:
-            print(f"ERROR: Could not find GGUF file for {GGUF_QUANT} in {repo_id}", file=sys.stderr)
-            print(f"Tried: {candidates}", file=sys.stderr)
+
+        # List all files in the repo and find a .gguf whose name contains the quant.
+        # This works across packagers (bartowski, TheBloke, etc.) regardless of
+        # how they prefix the filename.
+        print(f"Listing files in {repo_id}...", file=sys.stderr)
+        try:
+            all_files = list_repo_files(repo_id=repo_id, token=token)
+        except Exception as exc:
+            print(f"ERROR: Failed to list repo {repo_id}: {exc}", file=sys.stderr)
             sys.exit(1)
+
+        quant_lower = GGUF_QUANT.lower()
+        gguf_files = [f for f in all_files if f.lower().endswith(".gguf")]
+        matches = [f for f in gguf_files if quant_lower in f.lower()]
+
+        if not matches:
+            print(
+                f"ERROR: No .gguf file matching quant '{GGUF_QUANT}' found in {repo_id}",
+                file=sys.stderr,
+            )
+            print(f"Available .gguf files: {gguf_files}", file=sys.stderr)
+            sys.exit(1)
+
+        # Prefer the shortest match — avoids picking "Q4_K_M-imat" when the user
+        # asked for "Q4_K_M", or a sharded part when a single-file quant exists.
+        matches.sort(key=len)
+        filename = matches[0]
+        if len(matches) > 1:
+            print(
+                f"Multiple matches for {GGUF_QUANT}: {matches}. Picking {filename}.",
+                file=sys.stderr,
+            )
+
+        print(f"Pulling GGUF from HF: {repo_id}/{filename}", file=sys.stderr)
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=MODEL_DIR,
+            token=token,
+        )
+        print(f"Downloaded: {filename}", file=sys.stderr)
     else:
         print(f"Pulling from HF: {MODEL}", file=sys.stderr)
         snapshot_download(
