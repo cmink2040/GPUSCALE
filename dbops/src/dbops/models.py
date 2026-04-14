@@ -93,7 +93,7 @@ class BenchmarkResult(Base):
     __table_args__ = (
         CheckConstraint("gpu_vram_gb > 0", name="ck_gpu_vram_positive"),
         CheckConstraint("gpu_count >= 1 AND gpu_count <= 64", name="ck_gpu_count_range"),
-        CheckConstraint("provider IN ('local', 'vast.ai', 'runpod')", name="ck_provider_enum"),
+        CheckConstraint("provider IN ('local', 'vast.ai', 'vast.ai (community)', 'runpod')", name="ck_provider_enum"),
         CheckConstraint("engine IN ('llama.cpp', 'vllm')", name="ck_engine_enum"),
         CheckConstraint("tokens_per_sec > 0", name="ck_tps_positive"),
         CheckConstraint("time_to_first_token_ms >= 0", name="ck_ttft_non_negative"),
@@ -151,6 +151,7 @@ class BenchmarkResult(Base):
 class Provider(str, Enum):
     LOCAL = "local"
     VAST_AI = "vast.ai"
+    VAST_AI_COMMUNITY = "vast.ai (community)"
     RUNPOD = "runpod"
 
 
