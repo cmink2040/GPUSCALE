@@ -22,7 +22,7 @@ from rich.table import Table
 from dbops import db, validate
 from dbops.models import Engine as EngineEnum
 from dbops.models import GpuPriceCreate, PriceSource, PriceUnit, Provider
-from dbops.pricing import collect_all_cloud, normalize_gpu_name
+from dbops.pricing import collect_all_sources, normalize_gpu_name
 
 console = Console()
 error_console = Console(stderr=True)
@@ -415,14 +415,42 @@ def gp_latest(gpu: str | None) -> None:
     console.print(table)
 
 
-@gpu_price.command("collect-cloud")
-@click.option("--dry-run", is_flag=True, help="Show what would be inserted without touching the DB.")
-def gp_collect_cloud(dry_run: bool) -> None:
-    """Poll vast.ai (datacenter + community) and RunPod for current prices,
-    then insert a snapshot per GPU type per source.
+@gpu_price.command("collect")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be inserted without touching the DB.",
+)
+@click.option(
+    "--skip",
+    multiple=True,
+    type=click.Choice(["vast", "vast (community)", "runpod", "ebay"]),
+    help="Skip one or more sources (repeatable).",
+)
+def gp_collect(dry_run: bool, skip: tuple[str, ...]) -> None:
+    """Run every automated collector and insert a price snapshot per GPU.
+
+    Sources:
+
+    \b
+    - vast              vast.ai datacenter offers (min dph per GPU type)
+    - vast (community)  vast.ai community offers (min dph per GPU type)
+    - runpod            RunPod gpuTypes.lowestPrice (secure + community)
+    - ebay              eBay Browse API — cheapest USED listing per target
+                        GPU from a seller with >= 5000 positive feedback
+
+    Per-source auth:
+
+    \b
+    - vast:   VAST_API_KEY
+    - runpod: RUNPOD_API_KEY
+    - ebay:   EBAY_CLIENT_ID + EBAY_CLIENT_SECRET (app-only OAuth)
+
+    Any source whose credentials are missing will fail gracefully — the
+    other sources still run.
     """
-    console.print("[bold]Collecting cloud prices…[/bold]")
-    results = collect_all_cloud()
+    console.print("[bold]Collecting GPU prices from all automated sources…[/bold]")
+    results = collect_all_sources()
 
     # Report errors first so the user knows which sources failed
     for key in list(results.keys()):
@@ -430,14 +458,21 @@ def gp_collect_cloud(dry_run: bool) -> None:
             source = key[: -len("_error")]
             console.print(f"[red]{source}: {results[key][0]}[/red]")
 
+    all_sources = ["vast", "vast (community)", "runpod", "ebay"]
+    active_sources = [s for s in all_sources if s not in skip]
+
     total_rows = 0
-    for source_label in ("vast", "vast (community)", "runpod"):
-        rows = [r for r in results.get(source_label, []) if not isinstance(r, Exception)]
+    for source_label in active_sources:
+        rows = [
+            r for r in results.get(source_label, []) if not isinstance(r, Exception)
+        ]
+        unit_label = "/hr" if source_label != "ebay" else ""
+        price_width = ".4f" if source_label != "ebay" else ".2f"
         console.print(f"\n[bold]{source_label}[/bold]: {len(rows)} GPU(s)")
         for r in sorted(rows, key=lambda x: x.price_usd):
             console.print(
                 f"  {r.gpu_name:24s} {r.gpu_vram_gb:3.0f} GB   "
-                f"[green]${r.price_usd:.4f}/hr[/green]"
+                f"[green]${r.price_usd:{price_width}}{unit_label}[/green]"
             )
         total_rows += len(rows)
 
@@ -448,12 +483,23 @@ def gp_collect_cloud(dry_run: bool) -> None:
     console.print(f"\n[bold]Inserting {total_rows} rows…[/bold]")
     inserted = 0
     with db.get_session() as session:
-        for source_label in ("vast", "vast (community)", "runpod"):
-            rows = [r for r in results.get(source_label, []) if not isinstance(r, Exception)]
+        for source_label in active_sources:
+            rows = [
+                r for r in results.get(source_label, []) if not isinstance(r, Exception)
+            ]
             for payload in rows:
                 db.insert_price(session, payload.to_orm())
                 inserted += 1
     console.print(f"[green]Inserted {inserted} price rows.[/green]")
+
+
+# Back-compat alias — the pre-eBay name of this command.
+@gpu_price.command("collect-cloud", hidden=True)
+@click.option("--dry-run", is_flag=True)
+@click.pass_context
+def gp_collect_cloud_alias(ctx: click.Context, dry_run: bool) -> None:
+    """Deprecated alias for `gpu-price collect`. Skips ebay by default."""
+    ctx.invoke(gp_collect, dry_run=dry_run, skip=("ebay",))
 
 
 if __name__ == "__main__":
