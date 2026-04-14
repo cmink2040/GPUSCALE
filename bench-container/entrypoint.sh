@@ -170,8 +170,14 @@ echo "--- Benchmark complete: $SUCCESSES succeeded, $ERRORS failed ---" >&2
 echo "--- Stopping GPU metrics collection ---" >&2
 /app/scripts/collect_metrics.sh stop
 
-# Collect all output into a result file
-RESULT_FILE="/workspace/gpuscale_result.txt"
+# Collect all output into a result file.
+# Use /tmp by default — it's always writable on any cloud provider. /workspace
+# only exists on RunPod (persistent volume mount); on Vast.ai it doesn't exist,
+# which silently broke the redirect below and caused the S3 upload path to
+# error with FileNotFoundError, forcing every run through the vastai-logs
+# fallback and losing the GPU metrics CSV block. Override with RESULT_FILE env
+# var if you want to keep the result on a persistent volume.
+RESULT_FILE="${RESULT_FILE:-/tmp/gpuscale_result.txt}"
 {
     echo "=== ENGINE_OUTPUT_START ==="
     cat "$ENGINE_LOG" 2>/dev/null || true
