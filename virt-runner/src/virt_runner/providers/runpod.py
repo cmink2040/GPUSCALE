@@ -120,38 +120,17 @@ class RunPodProvider(BaseProvider):
             "startSsh": True,
             "env": env_list,
             "dockerArgs": vllm_args,
+            "cloudType": "SECURE",
         }
 
-        # Try requested GPU, then fallbacks
-        # vLLM Latest template requires Data Center GPUs (CUDA Forward Compatibility)
-        gpu_fallbacks = [
-            gpu_type, "NVIDIA RTX A5000", "NVIDIA RTX A6000",
-            "NVIDIA RTX A4000", "NVIDIA RTX A4500",
-            "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090",
-        ]
-        seen = set()
-        gpu_fallbacks = [g for g in gpu_fallbacks if not (g in seen or seen.add(g))]
-
-        pod = {}
-        for try_gpu in gpu_fallbacks:
-            try:
-                pod_input["gpuTypeId"] = try_gpu
-                pod_input["name"] = f"gpuscale-vllm-{try_gpu.replace(' ', '-').lower()}"
-                console.print(f"[dim]Trying {try_gpu}...[/dim]")
-                data = self._graphql(mutation, {"input": pod_input})
-                pod = data.get("podFindAndDeployOnDemand", {})
-                if pod.get("id"):
-                    gpu_type = try_gpu
-                    break
-            except RuntimeError as e:
-                if "SUPPLY_CONSTRAINT" in str(e) or "does not have the resources" in str(e):
-                    console.print(f"[dim]  No supply for {try_gpu}[/dim]")
-                    continue
-                raise
+        # Deploy on the exact requested GPU — no fallbacks for benchmarking
+        console.print(f"[dim]Deploying on {gpu_type}...[/dim]")
+        data = self._graphql(mutation, {"input": pod_input})
+        pod = data.get("podFindAndDeployOnDemand", {})
 
         pod_id = pod.get("id", "")
         if not pod_id:
-            raise RuntimeError("No GPU available for vLLM pod.")
+            raise RuntimeError(f"No {gpu_type} available on RunPod.")
 
         gpu_display = pod.get("machine", {}).get("gpuDisplayName", gpu_type) if pod.get("machine") else gpu_type
         console.print(f"[green]Created vLLM pod {pod_id} ({gpu_display})[/green]")
@@ -361,7 +340,14 @@ class RunPodProvider(BaseProvider):
             if not self._ssh_run_vllm_bench(instance.instance_id):
                 console.print("[yellow]SSH benchmark may have failed, checking S3 anyway...[/yellow]")
 
-        # Phase 3: Poll S3 for results
+        # Phase 3: Check if SSH captured results directly (no S3 dependency)
+        ssh_output = getattr(self, "_ssh_output", "")
+        if ssh_output and "=== ENGINE_OUTPUT_START ===" in ssh_output:
+            console.print(f"[green]Got results from SSH output ({len(ssh_output)} bytes)[/green]")
+            instance.extra["logs"] = ssh_output
+            return True
+
+        # Phase 4: Poll S3 for results (reduced timeout since SSH is preferred)
         logs = self._fetch_logs(instance.instance_id)
         if logs:
             instance.extra["logs"] = logs
@@ -515,7 +501,7 @@ class RunPodProvider(BaseProvider):
             }
         }
         """
-        deadline = time.time() + 1800  # 30 min timeout
+        deadline = time.time() + 3600  # 1 hour — model download + benchmark
         while time.time() < deadline:
             try:
                 data = self._graphql(query, {"input": {"podId": pod_id}})
@@ -630,7 +616,7 @@ class RunPodProvider(BaseProvider):
             # RunPod SSH proxy requires a PTY — send command via stdin
             channel = client.get_transport().open_session()
             channel.get_pty(width=200, height=50)
-            channel.settimeout(1800)
+            channel.settimeout(3600)  # 1 hour — model download + benchmark can be slow
             channel.invoke_shell()
 
             import socket
@@ -641,21 +627,21 @@ class RunPodProvider(BaseProvider):
             while channel.recv_ready():
                 channel.recv(4096)
 
-            # Send the command via stdin
-            channel.sendall(f"{cmd}\nexit\n".encode())
+            # Send the command via stdin — exit only after script completes
+            channel.sendall(f"{cmd} ; exit\n".encode())
 
-            # Stream output
-            output_lines = []
+            # Stream and capture output
+            captured_lines = []
             while True:
                 try:
                     data = channel.recv(4096)
                     if not data:
                         break
                     for line in data.decode(errors="replace").splitlines():
-                        # Filter out ANSI escape codes and shell prompt noise
                         clean = line.strip()
                         if clean and not clean.startswith("[?") and not clean.startswith("]0;"):
                             console.print(f"[dim]  {clean}[/dim]")
+                            captured_lines.append(clean)
                 except socket.timeout:
                     break
 
@@ -665,7 +651,9 @@ class RunPodProvider(BaseProvider):
 
             channel.close()
             client.close()
-            return True  # Script ran, check S3 for results
+
+            self._ssh_output = "\n".join(captured_lines)
+            return True
 
         except Exception as exc:
             console.print(f"[red]SSH execution failed: {exc}[/red]")
@@ -701,7 +689,7 @@ class RunPodProvider(BaseProvider):
         else:
             console.print(f"[bold]Waiting for results in s3://{s3.bucket}/results/...[/bold]")
 
-        deadline = time.time() + 1800
+        deadline = time.time() + 300  # 5 min — SSH output is preferred path
         while time.time() < deadline:
             # Check pod status
             try:
