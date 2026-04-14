@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM model and Pydantic validation models for benchmark_results."""
+"""SQLAlchemy ORM models and Pydantic validation models for the dbops tables."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    String,
     Text,
     func,
 )
@@ -144,6 +145,87 @@ class BenchmarkResult(Base):
 
 
 # ---------------------------------------------------------------------------
+# GPU pricing
+# ---------------------------------------------------------------------------
+#
+# One row per (gpu_name, source, snapshot). Sources fall into two buckets:
+#
+#   * Hardware "buy it once" prices in USD, collected manually:
+#       - ebay         lowest from a seller with 5K+ positive reviews where
+#                      the listing matches the exact GPU SKU
+#       - amazon       lowest "with reviews" listing for the exact SKU
+#
+#   * Cloud hourly rentals in USD/hr, collected automatically by polling
+#     the provider APIs:
+#       - vast                    vast.ai datacenter cloud
+#       - vast (community)        vast.ai community cloud
+#       - runpod                  RunPod (defaults to SECURE tier)
+#
+# Pricing changes over time, so we keep the full history rather than
+# overwriting in place — the latest row per (gpu, source) is "current".
+
+
+class GpuPrice(Base):
+    __tablename__ = "gpu_prices"
+
+    # Identity
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # GPU identity (matches benchmark_results.gpu_name + gpu_vram_gb)
+    gpu_name: Mapped[str] = mapped_column(Text, nullable=False)
+    gpu_vram_gb: Mapped[float] = mapped_column(Numeric, nullable=False)
+
+    # Where the price came from
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 'one_time' for ebay/amazon hardware purchases, 'per_hour' for cloud rentals
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+    price_usd: Mapped[float] = mapped_column(Numeric, nullable=False)
+
+    # Optional listing details — for buy-once sources we want the URL +
+    # seller info so the manually-collected number is auditable.
+    listing_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    seller: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Full provider response / scraper output for audit
+    raw_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("price_usd > 0", name="ck_price_usd_positive"),
+        CheckConstraint("gpu_vram_gb > 0", name="ck_gp_gpu_vram_positive"),
+        CheckConstraint(
+            "source IN ('ebay', 'amazon', 'vast', 'vast (community)', 'runpod')",
+            name="ck_gp_source_enum",
+        ),
+        CheckConstraint(
+            "unit IN ('one_time', 'per_hour')",
+            name="ck_gp_unit_enum",
+        ),
+        CheckConstraint(
+            # Hardware sources must be one_time, cloud sources must be per_hour.
+            "(source IN ('ebay', 'amazon') AND unit = 'one_time') "
+            "OR (source IN ('vast', 'vast (community)', 'runpod') AND unit = 'per_hour')",
+            name="ck_gp_source_unit_consistency",
+        ),
+        Index("ix_gp_gpu_name", "gpu_name"),
+        Index("ix_gp_source", "source"),
+        Index("ix_gp_collected_at", "collected_at"),
+        # Composite for the common "latest price for gpu/source" query
+        Index("ix_gp_gpu_source_collected", "gpu_name", "source", "collected_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<GpuPrice {self.id} {self.gpu_name} {self.source}={self.price_usd}>"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Pydantic validation models (used by CLI before DB insert)
 # ---------------------------------------------------------------------------
 
@@ -153,6 +235,68 @@ class Provider(str, Enum):
     VAST_AI = "vast.ai"
     VAST_AI_COMMUNITY = "vast.ai (community)"
     RUNPOD = "runpod"
+
+
+class PriceSource(str, Enum):
+    EBAY = "ebay"
+    AMAZON = "amazon"
+    VAST = "vast"
+    VAST_COMMUNITY = "vast (community)"
+    RUNPOD = "runpod"
+
+
+class PriceUnit(str, Enum):
+    ONE_TIME = "one_time"
+    PER_HOUR = "per_hour"
+
+
+_HARDWARE_SOURCES = {PriceSource.EBAY, PriceSource.AMAZON}
+_CLOUD_SOURCES = {PriceSource.VAST, PriceSource.VAST_COMMUNITY, PriceSource.RUNPOD}
+
+
+class GpuPriceCreate(BaseModel):
+    """Schema for inserting a new GPU price row."""
+
+    gpu_name: str = Field(..., min_length=1, max_length=128)
+    gpu_vram_gb: float = Field(..., gt=0, le=1000)
+    source: PriceSource
+    unit: PriceUnit
+    price_usd: float = Field(..., gt=0)
+    listing_url: str | None = Field(default=None, max_length=2048)
+    seller: str | None = Field(default=None, max_length=256)
+    notes: str | None = Field(default=None, max_length=1024)
+    raw_metadata: dict[str, Any] | None = None
+
+    @field_validator("gpu_name")
+    @classmethod
+    def strip_gpu_name(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("unit")
+    @classmethod
+    def unit_matches_source(cls, v: PriceUnit, info: Any) -> PriceUnit:
+        source = info.data.get("source")
+        if source in _HARDWARE_SOURCES and v != PriceUnit.ONE_TIME:
+            raise ValueError(f"source={source.value} requires unit=one_time")
+        if source in _CLOUD_SOURCES and v != PriceUnit.PER_HOUR:
+            raise ValueError(f"source={source.value} requires unit=per_hour")
+        return v
+
+    def to_orm(self) -> GpuPrice:
+        data = self.model_dump(exclude_none=True)
+        data["source"] = self.source.value
+        data["unit"] = self.unit.value
+        return GpuPrice(**data)
+
+
+class GpuPriceRow(GpuPriceCreate):
+    """A full GpuPrice row as returned from the database."""
+
+    id: uuid.UUID
+    collected_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class Engine(str, Enum):

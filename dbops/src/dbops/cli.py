@@ -21,7 +21,8 @@ from rich.table import Table
 
 from dbops import db, validate
 from dbops.models import Engine as EngineEnum
-from dbops.models import Provider
+from dbops.models import GpuPriceCreate, PriceSource, PriceUnit, Provider
+from dbops.pricing import collect_all_cloud, normalize_gpu_name
 
 console = Console()
 error_console = Console(stderr=True)
@@ -231,6 +232,228 @@ def revision(message: str, autogenerate: bool) -> None:
     console.print(f"[dim]Creating revision: {message}[/dim]")
     command.revision(alembic_cfg, message=message, autogenerate=autogenerate)
     console.print("[green]Revision created.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# gpu-price group
+# ---------------------------------------------------------------------------
+
+
+@cli.group("gpu-price")
+def gpu_price() -> None:
+    """Manage GPU price snapshots (gpu_prices table).
+
+    Two flavors of source:
+
+    \b
+    - Hardware buy-once prices (ebay, amazon): use `gpu-price add`.
+      * ebay:   lowest listing from a seller with 5K+ positive reviews
+                where the listing matches the exact GPU SKU
+      * amazon: lowest "with reviews" listing for the exact SKU
+
+    \b
+    - Cloud hourly rentals (vast, vast (community), runpod): use
+      `gpu-price collect-cloud`. Reads current offers from the
+      provider APIs and inserts one row per GPU type per source with
+      the lowest dph observed.
+    """
+
+
+def _pick_unit(source: PriceSource) -> PriceUnit:
+    if source in (PriceSource.EBAY, PriceSource.AMAZON):
+        return PriceUnit.ONE_TIME
+    return PriceUnit.PER_HOUR
+
+
+@gpu_price.command("add")
+@click.option("--gpu", "gpu_name", required=True, help="GPU name (e.g. 'RTX 4090').")
+@click.option("--vram-gb", type=float, required=True, help="VRAM in GB (e.g. 24).")
+@click.option(
+    "--source",
+    type=click.Choice([s.value for s in PriceSource]),
+    required=True,
+    help="Pricing source.",
+)
+@click.option("--price", type=float, required=True, help="Price in USD.")
+@click.option("--url", "listing_url", default=None, help="Listing URL (ebay/amazon).")
+@click.option("--seller", default=None, help="Seller name (ebay).")
+@click.option("--notes", default=None, help="Freeform notes.")
+def gp_add(
+    gpu_name: str,
+    vram_gb: float,
+    source: str,
+    price: float,
+    listing_url: str | None,
+    seller: str | None,
+    notes: str | None,
+) -> None:
+    """Add a GPU price snapshot (manual entry, typically for ebay/amazon)."""
+    src = PriceSource(source)
+    unit = _pick_unit(src)
+    normalized = normalize_gpu_name(gpu_name)
+    payload = GpuPriceCreate(
+        gpu_name=normalized,
+        gpu_vram_gb=vram_gb,
+        source=src,
+        unit=unit,
+        price_usd=price,
+        listing_url=listing_url,
+        seller=seller,
+        notes=notes,
+    )
+    with db.get_session() as session:
+        row = db.insert_price(session, payload.to_orm())
+        console.print(
+            f"[green]Inserted[/green] {row.gpu_name} ({row.gpu_vram_gb} GB) "
+            f"{row.source} ${row.price_usd:.4f} [dim]id={row.id}[/dim]"
+        )
+
+
+@gpu_price.command("list")
+@click.option("--gpu", default=None, help="Filter by GPU name substring.")
+@click.option(
+    "--source",
+    default=None,
+    type=click.Choice([s.value for s in PriceSource]),
+    help="Filter by source.",
+)
+@click.option("-n", "--limit", default=50, show_default=True)
+def gp_list(gpu: str | None, source: str | None, limit: int) -> None:
+    """List GPU price rows, newest first."""
+    # Snapshot rows into plain tuples inside the session so display can
+    # happen after it closes (SQLAlchemy lazy-loads by default).
+    with db.get_session() as session:
+        rows = db.list_prices(session, limit=limit, gpu_name=gpu, source=source)
+        snapshots = [
+            (
+                r.gpu_name,
+                float(r.gpu_vram_gb),
+                r.source,
+                float(r.price_usd),
+                r.unit,
+                str(r.collected_at)[:19] if r.collected_at else "",
+            )
+            for r in rows
+        ]
+
+    if not snapshots:
+        console.print("[dim]No prices found.[/dim]")
+        return
+
+    table = Table(title=f"GPU prices ({len(snapshots)})", show_lines=False)
+    table.add_column("GPU")
+    table.add_column("VRAM", justify="right")
+    table.add_column("Source")
+    table.add_column("Price (USD)", justify="right")
+    table.add_column("Unit")
+    table.add_column("Collected", style="dim")
+    for gpu_name, vram, src, price, unit, collected in snapshots:
+        price_display = f"${price:.4f}" if unit == "per_hour" else f"${price:.2f}"
+        table.add_row(
+            gpu_name,
+            f"{vram:.0f}",
+            src,
+            price_display,
+            unit,
+            collected,
+        )
+    console.print(table)
+
+
+@gpu_price.command("latest")
+@click.option("--gpu", default=None, help="Filter by GPU name substring.")
+def gp_latest(gpu: str | None) -> None:
+    """Show the most recent price per (GPU, source)."""
+    with db.get_session() as session:
+        rows = db.latest_prices(session, gpu_name=gpu)
+        # Snapshot into plain dicts so we can close the session cleanly.
+        snapshots = [
+            {
+                "gpu_name": r.gpu_name,
+                "gpu_vram_gb": float(r.gpu_vram_gb),
+                "source": r.source,
+                "price_usd": float(r.price_usd),
+            }
+            for r in rows
+        ]
+
+    if not snapshots:
+        console.print("[dim]No prices found.[/dim]")
+        return
+
+    # Group by gpu_name
+    by_gpu: dict[str, list[dict]] = {}
+    for r in snapshots:
+        by_gpu.setdefault(r["gpu_name"], []).append(r)
+
+    table = Table(title=f"Latest GPU prices ({len(by_gpu)} GPUs, {len(snapshots)} snapshots)")
+    table.add_column("GPU")
+    table.add_column("VRAM", justify="right")
+    table.add_column("ebay", justify="right")
+    table.add_column("amazon", justify="right")
+    table.add_column("vast/hr", justify="right")
+    table.add_column("vast-comm/hr", justify="right")
+    table.add_column("runpod/hr", justify="right")
+
+    def fmt(price: float | None, unit: str) -> str:
+        if price is None:
+            return "[dim]-[/dim]"
+        return f"${price:.2f}" if unit == "one_time" else f"${price:.4f}"
+
+    for gpu_name in sorted(by_gpu.keys()):
+        group = {r["source"]: r["price_usd"] for r in by_gpu[gpu_name]}
+        vram = by_gpu[gpu_name][0]["gpu_vram_gb"]
+        table.add_row(
+            gpu_name,
+            f"{vram:.0f}",
+            fmt(group.get("ebay"), "one_time"),
+            fmt(group.get("amazon"), "one_time"),
+            fmt(group.get("vast"), "per_hour"),
+            fmt(group.get("vast (community)"), "per_hour"),
+            fmt(group.get("runpod"), "per_hour"),
+        )
+    console.print(table)
+
+
+@gpu_price.command("collect-cloud")
+@click.option("--dry-run", is_flag=True, help="Show what would be inserted without touching the DB.")
+def gp_collect_cloud(dry_run: bool) -> None:
+    """Poll vast.ai (datacenter + community) and RunPod for current prices,
+    then insert a snapshot per GPU type per source.
+    """
+    console.print("[bold]Collecting cloud prices…[/bold]")
+    results = collect_all_cloud()
+
+    # Report errors first so the user knows which sources failed
+    for key in list(results.keys()):
+        if key.endswith("_error"):
+            source = key[: -len("_error")]
+            console.print(f"[red]{source}: {results[key][0]}[/red]")
+
+    total_rows = 0
+    for source_label in ("vast", "vast (community)", "runpod"):
+        rows = [r for r in results.get(source_label, []) if not isinstance(r, Exception)]
+        console.print(f"\n[bold]{source_label}[/bold]: {len(rows)} GPU(s)")
+        for r in sorted(rows, key=lambda x: x.price_usd):
+            console.print(
+                f"  {r.gpu_name:24s} {r.gpu_vram_gb:3.0f} GB   "
+                f"[green]${r.price_usd:.4f}/hr[/green]"
+            )
+        total_rows += len(rows)
+
+    if dry_run:
+        console.print(f"\n[yellow]Dry run — {total_rows} rows not inserted.[/yellow]")
+        return
+
+    console.print(f"\n[bold]Inserting {total_rows} rows…[/bold]")
+    inserted = 0
+    with db.get_session() as session:
+        for source_label in ("vast", "vast (community)", "runpod"):
+            rows = [r for r in results.get(source_label, []) if not isinstance(r, Exception)]
+            for payload in rows:
+                db.insert_price(session, payload.to_orm())
+                inserted += 1
+    console.print(f"[green]Inserted {inserted} price rows.[/green]")
 
 
 if __name__ == "__main__":

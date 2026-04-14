@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, desc, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from dbops.models import BenchmarkResult
+from dbops.models import BenchmarkResult, GpuPrice
 
 _engine: Engine | None = None
 _SessionFactory: sessionmaker[Session] | None = None
@@ -121,3 +121,56 @@ def delete_result(session: Session, result_id: str) -> BenchmarkResult | None:
     session.delete(result)
     session.flush()
     return result
+
+
+# ---------------------------------------------------------------------------
+# gpu_prices helpers
+# ---------------------------------------------------------------------------
+
+
+def insert_price(session: Session, price: GpuPrice) -> GpuPrice:
+    """Insert a GPU price row. Returns the instance with id/collected_at populated."""
+    session.add(price)
+    session.flush()
+    session.refresh(price)
+    return price
+
+
+def list_prices(
+    session: Session,
+    *,
+    limit: int = 100,
+    gpu_name: str | None = None,
+    source: str | None = None,
+) -> list[GpuPrice]:
+    """Query GPU prices with optional filters, newest first."""
+    stmt = select(GpuPrice)
+    if gpu_name:
+        stmt = stmt.where(GpuPrice.gpu_name.ilike(f"%{gpu_name}%"))
+    if source:
+        stmt = stmt.where(GpuPrice.source == source)
+    stmt = stmt.order_by(desc(GpuPrice.collected_at)).limit(limit)
+    return list(session.scalars(stmt).all())
+
+
+def latest_prices(session: Session, gpu_name: str | None = None) -> list[GpuPrice]:
+    """Return the most recent price per (gpu_name, source). Optional gpu filter.
+
+    Implemented in Python rather than SQL DISTINCT ON so the helper stays
+    portable across drivers and works against a small price catalog. The
+    expected row count is in the low thousands.
+    """
+    stmt = select(GpuPrice)
+    if gpu_name:
+        stmt = stmt.where(GpuPrice.gpu_name.ilike(f"%{gpu_name}%"))
+    stmt = stmt.order_by(desc(GpuPrice.collected_at))
+    rows = list(session.scalars(stmt).all())
+    seen: set[tuple[str, str]] = set()
+    latest: list[GpuPrice] = []
+    for r in rows:
+        key = (r.gpu_name, r.source)
+        if key in seen:
+            continue
+        seen.add(key)
+        latest.append(r)
+    return latest
