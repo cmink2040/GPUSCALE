@@ -33,3 +33,18 @@ export interface SortConfig {
   column: keyof BenchmarkResult;
   direction: SortDirection;
 }
+
+// Display-time augmentations attached by the normalization layer.
+export interface DisplayRow extends BenchmarkResult {
+  merged_count?: number;        // how many raw rows this represents (1 = unmerged)
+  normalized?: boolean;         // true if tok/s was transformed
+  original_tps?: number;        // raw tok/s prior to normalization, for tooltip
+  transform_notes?: string;     // human description of applied transforms
+}
+
+// Toggleable normalization knobs. Adding a new toggle = adding a key here +
+// handling it in `applyNormalizations`.
+export interface NormalizationOpts {
+  weight: boolean;   // normalize across model/quant by bytes-per-token ratio
+  tier: boolean;     // boost community runs to datacenter-equivalent
+}
