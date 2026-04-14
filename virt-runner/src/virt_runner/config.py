@@ -145,11 +145,14 @@ class JobConfig(BaseModel):
             env["S3_BUCKET"] = self.s3.bucket
             env["AWS_DEFAULT_REGION"] = os.getenv("WASABI_REGION", "us-east-1")
 
-            # Auto-derive model key from model name + format if not explicitly set
+            # Auto-derive model key from model name + format if not explicitly set.
+            # Only "full" weights live in S3 (Meta-distributed / gated) — GGUF and
+            # GPTQ are always pulled from HuggingFace, so we must not hand the
+            # container an S3 key for those formats, or pull_model.py will try S3
+            # first, find nothing, and never fall through to HF.
             model_key = self.s3.model_key
-            if not model_key and self.model:
-                fmt = self.model_format or "full"
-                model_key = f"{self.model}/{fmt}"
+            if not model_key and self.model and self.model_format in ("", "full"):
+                model_key = f"{self.model}/full"
             if model_key:
                 env["S3_MODEL_KEY"] = model_key
 

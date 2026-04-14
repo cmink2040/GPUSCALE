@@ -30,8 +30,10 @@ def already_downloaded() -> bool:
     return False
 
 
-def pull_from_s3():
-    """Download model files from Wasabi S3."""
+def pull_from_s3() -> int:
+    """Download model files from Wasabi S3. Returns count of files
+    downloaded + already-present. Zero means the S3 prefix is empty or
+    doesn't exist, in which case the caller should fall through to HF."""
     import boto3
 
     endpoint = os.environ["S3_ENDPOINT"]
@@ -73,6 +75,7 @@ def pull_from_s3():
             downloaded += 1
 
     print(f"S3 download complete. {downloaded} downloaded, {skipped} skipped.", file=sys.stderr)
+    return downloaded + skipped
 
 
 def pull_from_huggingface():
@@ -145,10 +148,25 @@ def main():
     if already_downloaded():
         return
 
-    # Priority 1: Pull from S3 (private/gated models — includes Meta .pth format)
+    # Priority 1: Pull from S3 (private/gated models — primarily Meta .pth full
+    # weights). If virt-runner auto-derives an S3 key for a model that isn't
+    # actually mirrored to S3 (e.g. a community GGUF repo), the listing yields
+    # 0 files. In that case, fall through to HuggingFace rather than failing
+    # silently with an empty /models/. This makes the container agnostic to
+    # whether a given model lives in S3 or on the Hub.
     if os.environ.get("S3_BUCKET") and S3_MODEL_KEY:
-        pull_from_s3()
-        return
+        try:
+            count = pull_from_s3()
+        except Exception as exc:
+            print(f"S3 pull raised {type(exc).__name__}: {exc}. Falling back to HuggingFace.", file=sys.stderr)
+            count = 0
+        if count > 0:
+            return
+        print(
+            f"S3 prefix s3://{os.environ.get('S3_BUCKET','')}/{S3_MODEL_KEY} "
+            f"yielded 0 files; falling back to HuggingFace.",
+            file=sys.stderr,
+        )
 
     # Priority 2: Pull from HuggingFace (public models)
     pull_from_huggingface()
