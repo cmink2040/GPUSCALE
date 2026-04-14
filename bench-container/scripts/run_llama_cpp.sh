@@ -23,16 +23,26 @@ echo "Using model: $GGUF_FILE" >&2
 
 # Run llama.cpp inference
 # -ngl 999: offload all layers to GPU
-# -st (--single-turn): with --prompt set, runs one generation and exits
-#   non-interactively. This is the documented escape hatch for chat-template
-#   GGUFs that otherwise auto-enable conversation mode and flood stdin with
-#   `> ` prompts forever. `-no-cnv` alone is not sufficient on recent builds.
-llama-cli \
-    -m "$GGUF_FILE" \
-    -p "$PROMPT" \
-    -n "$MAX_TOKENS" \
-    --temp "$TEMPERATURE" \
-    --top-p "$TOP_P" \
-    -ngl 999 \
-    -st \
-    2>&1
+# -st (--single-turn): with --prompt set, runs one generation and exits.
+#
+# We wrap the invocation in `script -qfc ... /dev/null` to allocate a
+# pseudo-tty. Recent llama-cli builds detect isatty() and suppress the
+# banner, generated tokens, and the "[ Prompt: X t/s | Generation: Y t/s ]"
+# timing summary when stdout is a pipe — which is exactly what happens
+# when subprocess.run captures output. With a pty in the middle, llama-cli
+# writes the full interactive UI and `script` forwards it to our stdout
+# where the orchestrator's parser can see it.
+#
+# printf '%q' shell-escapes the prompt so `script -c` can eval it safely.
+LLAMA_ARGS=(
+    llama-cli
+    -m "$GGUF_FILE"
+    -p "$PROMPT"
+    -n "$MAX_TOKENS"
+    --temp "$TEMPERATURE"
+    --top-p "$TOP_P"
+    -ngl 999
+    -st
+)
+QUOTED_CMD=$(printf '%q ' "${LLAMA_ARGS[@]}")
+script -qfc "$QUOTED_CMD" /dev/null 2>&1
