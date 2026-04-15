@@ -22,7 +22,12 @@ from rich.table import Table
 from dbops import db, validate
 from dbops.models import Engine as EngineEnum
 from dbops.models import GpuPriceCreate, PriceSource, PriceUnit, Provider
-from dbops.pricing import collect_all_sources, normalize_gpu_name
+from dbops.pricing import (
+    EBAY_TARGETS,
+    collect_all_sources,
+    fetch_ebay_candidates,
+    normalize_gpu_name,
+)
 
 console = Console()
 error_console = Console(stderr=True)
@@ -415,20 +420,14 @@ def gp_latest(gpu: str | None) -> None:
     console.print(table)
 
 
-@gpu_price.command("collect")
+@gpu_price.command("collect-cloud")
 @click.option(
     "--dry-run",
     is_flag=True,
     help="Show what would be inserted without touching the DB.",
 )
-@click.option(
-    "--skip",
-    multiple=True,
-    type=click.Choice(["vast", "vast (community)", "runpod", "ebay"]),
-    help="Skip one or more sources (repeatable).",
-)
-def gp_collect(dry_run: bool, skip: tuple[str, ...]) -> None:
-    """Run every automated collector and insert a price snapshot per GPU.
+def gp_collect_cloud(dry_run: bool) -> None:
+    """Run every automated cloud collector and insert a snapshot per GPU.
 
     Sources:
 
@@ -436,43 +435,35 @@ def gp_collect(dry_run: bool, skip: tuple[str, ...]) -> None:
     - vast              vast.ai datacenter offers (min dph per GPU type)
     - vast (community)  vast.ai community offers (min dph per GPU type)
     - runpod            RunPod gpuTypes.lowestPrice (secure + community)
-    - ebay              eBay Browse API — cheapest USED listing per target
-                        GPU from a seller with >= 5000 positive feedback
 
-    Per-source auth:
+    Auth:
 
     \b
-    - vast:   VAST_API_KEY
-    - runpod: RUNPOD_API_KEY
-    - ebay:   EBAY_CLIENT_ID + EBAY_CLIENT_SECRET (app-only OAuth)
+    - VAST_API_KEY
+    - RUNPOD_API_KEY
 
-    Any source whose credentials are missing will fail gracefully — the
-    other sources still run.
+    A failing source doesn't block the others. eBay is NOT part of this
+    command — see `gpu-price ebay-candidates` for the human-in-the-loop
+    eBay flow.
     """
-    console.print("[bold]Collecting GPU prices from all automated sources…[/bold]")
+    console.print("[bold]Collecting cloud prices…[/bold]")
     results = collect_all_sources()
 
-    # Report errors first so the user knows which sources failed
     for key in list(results.keys()):
         if key.endswith("_error"):
             source = key[: -len("_error")]
             console.print(f"[red]{source}: {results[key][0]}[/red]")
 
-    all_sources = ["vast", "vast (community)", "runpod", "ebay"]
-    active_sources = [s for s in all_sources if s not in skip]
-
     total_rows = 0
-    for source_label in active_sources:
+    for source_label in ("vast", "vast (community)", "runpod"):
         rows = [
             r for r in results.get(source_label, []) if not isinstance(r, Exception)
         ]
-        unit_label = "/hr" if source_label != "ebay" else ""
-        price_width = ".4f" if source_label != "ebay" else ".2f"
         console.print(f"\n[bold]{source_label}[/bold]: {len(rows)} GPU(s)")
         for r in sorted(rows, key=lambda x: x.price_usd):
             console.print(
                 f"  {r.gpu_name:24s} {r.gpu_vram_gb:3.0f} GB   "
-                f"[green]${r.price_usd:{price_width}}{unit_label}[/green]"
+                f"[green]${r.price_usd:.4f}/hr[/green]"
             )
         total_rows += len(rows)
 
@@ -483,7 +474,7 @@ def gp_collect(dry_run: bool, skip: tuple[str, ...]) -> None:
     console.print(f"\n[bold]Inserting {total_rows} rows…[/bold]")
     inserted = 0
     with db.get_session() as session:
-        for source_label in active_sources:
+        for source_label in ("vast", "vast (community)", "runpod"):
             rows = [
                 r for r in results.get(source_label, []) if not isinstance(r, Exception)
             ]
@@ -493,13 +484,143 @@ def gp_collect(dry_run: bool, skip: tuple[str, ...]) -> None:
     console.print(f"[green]Inserted {inserted} price rows.[/green]")
 
 
-# Back-compat alias — the pre-eBay name of this command.
-@gpu_price.command("collect-cloud", hidden=True)
-@click.option("--dry-run", is_flag=True)
-@click.pass_context
-def gp_collect_cloud_alias(ctx: click.Context, dry_run: bool) -> None:
-    """Deprecated alias for `gpu-price collect`. Skips ebay by default."""
-    ctx.invoke(gp_collect, dry_run=dry_run, skip=("ebay",))
+@gpu_price.command("ebay-candidates")
+@click.option("--gpu", "gpu_name", required=True, help="Target GPU name (e.g. 'RTX 4090').")
+@click.option("--vram", "vram_gb", type=float, default=None, help="VRAM in GB. Appended to the search query to disambiguate variants (e.g. V100 16 vs 32).")
+@click.option("--query", default=None, help="Override the search query. Default: 'Nvidia <gpu> <vram>GB'.")
+@click.option("-n", "--limit", default=10, show_default=True, help="Max candidates to return.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a human-readable table.")
+@click.option("--no-description", is_flag=True, help="Skip the getItem description fetch (faster but less useful for AI review).")
+def gp_ebay_candidates(
+    gpu_name: str,
+    vram_gb: float | None,
+    query: str | None,
+    limit: int,
+    as_json: bool,
+    no_description: bool,
+) -> None:
+    """Fetch eBay candidate listings for AI review (does NOT auto-pick).
+
+    This is the external-agent flow for eBay pricing. The tool:
+
+    \b
+      1. Mints an eBay OAuth token (client credentials grant)
+      2. Searches `item_summary/search` sorted cheapest-first
+      3. Pre-filters by seller.feedbackScore >= 5000 (noise floor only)
+      4. Fetches the full description for each kept listing via getItem
+      5. Prints the candidates — including price, shipping, total, seller
+         feedback, title, condition, listing URL, and the description
+         text — and stops
+
+    An external AI agent (e.g. another Claude Code instance) reads the
+    output, decides which listing is legitimate (catching parts-only
+    traps, 'READ DESCRIPTION' gotchas, SKU mismatches, suspiciously low
+    prices, etc.), and then calls `dbops gpu-price add --source ebay ...`
+    to record its choice. No auto-picking is ever done by this tool.
+
+    Requires EBAY_CLIENT_ID and EBAY_CLIENT_SECRET env vars.
+    """
+    try:
+        result = fetch_ebay_candidates(
+            gpu_name=gpu_name,
+            vram_gb=vram_gb,
+            query=query,
+            limit=limit,
+            with_description=not no_description,
+        )
+    except Exception as exc:
+        error_console.print(f"[red]ebay fetch failed: {exc}[/red]")
+        raise click.exceptions.Exit(1)
+
+    if as_json:
+        import json as _json
+
+        click.echo(_json.dumps(result, indent=2, default=str))
+        return
+
+    # Human-readable output — table of candidates followed by descriptions
+    console.print()
+    console.print(
+        f"[bold]eBay candidates[/bold] for [cyan]{result['gpu_name']}[/cyan]"
+        + (f" {result['vram_gb']:.0f} GB" if result["vram_gb"] else "")
+        + f"  [dim](query: {result['query']})[/dim]"
+    )
+    console.print(
+        f"[dim]Fetched {result['fetched_at']} · "
+        f"seller feedback floor >= {result['seller_feedback_floor']} · "
+        f"{len(result['candidates'])} candidates[/dim]"
+    )
+
+    if not result["candidates"]:
+        console.print("[yellow]No candidates passed the feedback floor.[/yellow]")
+        return
+
+    table = Table(show_lines=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Price", justify="right")
+    table.add_column("Ship", justify="right", style="dim")
+    table.add_column("Total", justify="right", style="bold")
+    table.add_column("Title")
+    table.add_column("Seller")
+    table.add_column("Feedback", justify="right")
+    for c in result["candidates"]:
+        ship = c.get("shipping_usd")
+        ship_str = f"${ship:.2f}" if ship is not None else "—"
+        fb = c["seller"].get("feedback_score")
+        pct = c["seller"].get("feedback_percentage")
+        fb_str = f"{fb:,} ({pct}%)" if fb is not None else "—"
+        table.add_row(
+            str(c["rank"]),
+            f"${c['price_usd']:.2f}",
+            ship_str,
+            f"${c['total_usd']:.2f}",
+            (c.get("title") or "")[:60],
+            (c["seller"].get("username") or "")[:20],
+            fb_str,
+        )
+    console.print(table)
+
+    # Separately dump each description for the agent to read
+    console.print()
+    console.print("[bold]Descriptions[/bold] [dim](read carefully — this is where the scams live)[/dim]")
+    for c in result["candidates"]:
+        desc = c.get("description") or "[no description available]"
+        console.print()
+        console.print(
+            f"[bold cyan]#{c['rank']}[/bold cyan]  "
+            f"${c['price_usd']:.2f}  "
+            f"[dim]{c.get('item_id', '')}[/dim]"
+        )
+        console.print(f"  [bold]{c.get('title')}[/bold]")
+        console.print(f"  [dim]{c.get('listing_url')}[/dim]")
+        # Indent description
+        for line in desc.split("\n"):
+            console.print(f"  {line}")
+
+    console.print()
+    console.print(
+        "[dim]To record a chosen listing: [/dim]"
+        f"[bold]dbops gpu-price add --gpu '{result['gpu_name']}' "
+        f"--vram-gb {result['vram_gb']:.0f} --source ebay "
+        "--price <USD> --url '<listing_url>' --seller '<username>' "
+        "--notes '<why this one>'[/bold]"
+    )
+
+
+@gpu_price.command("ebay-targets")
+def gp_ebay_targets() -> None:
+    """Print the default list of GPUs that an agent might want to review.
+
+    These are the GPUs we currently benchmark — a good iteration list for
+    an agent that wants to refresh eBay prices for everything in one pass.
+    """
+    table = Table(title=f"Default eBay target list ({len(EBAY_TARGETS)} GPUs)")
+    table.add_column("GPU")
+    table.add_column("VRAM", justify="right")
+    table.add_column("Default query", style="dim")
+    for gpu_name, vram, query in EBAY_TARGETS:
+        table.add_row(gpu_name, f"{int(vram)} GB", query)
+    console.print(table)
 
 
 if __name__ == "__main__":

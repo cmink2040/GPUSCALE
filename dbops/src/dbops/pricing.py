@@ -1,16 +1,21 @@
-"""Automated GPU price collectors for vast.ai, RunPod, and eBay.
+"""GPU price collectors and the eBay candidate fetcher.
 
-Produces `GpuPriceCreate` records ready to insert into `gpu_prices`. All
-collectors normalize `gpu_name` to a short form (no "NVIDIA" / "GeForce"
-prefix) so rows line up with what `benchmark_results.gpu_name` already
-contains.
+Two flavors of tooling live here:
 
-- Cloud rentals (vast, vast community, runpod) — per-hour prices via
-  provider APIs, dumped for every GPU type the provider exposes.
-- eBay (hardware one-time) — one-shot Browse API search per target GPU
-  SKU, filtered to sellers with >=5000 positive feedback, cheapest
-  remaining listing wins. Requires EBAY_CLIENT_ID and EBAY_CLIENT_SECRET
-  env vars (app-only OAuth, client credentials grant).
+1. Automated cloud collectors (vast, vast community, runpod) — per-hour
+   prices via provider APIs, dumped for every GPU type the provider
+   exposes. These are safe to auto-pick because the provider APIs
+   return authoritative per-GPU rates.
+
+2. eBay Browse API candidate fetcher — does NOT auto-pick. eBay
+   listings are adversarial: a $10 "RTX 3060" from a 5K+ feedback
+   seller is usually a for-parts/"READ DESCRIPTION" trap that no
+   static filter can reliably catch. Instead, this module just fetches
+   candidate listings (title, price, seller, description, shipping,
+   URL) and returns them as structured records for an external AI
+   agent to review. The agent reads each description, flags scams,
+   picks the right listing, and calls `dbops gpu-price add` to record
+   its choice. Human/agent judgment stays in the loop.
 
 Amazon prices stay manual (`dbops gpu-price add`) for now — adding
 Amazon's Product Advertising API has an Associates-program gate and
@@ -228,30 +233,27 @@ def collect_runpod_prices() -> list[GpuPriceCreate]:
 # OAuth flow: POST client_id:client_secret (base64) to the token endpoint
 # with grant_type=client_credentials and a scope, get an access token good
 # for 2 hours, then use it as a Bearer on the Browse API. The free default
-# quota is 5000 Browse calls per day — we'll use ~30 per collection run.
+# quota is 5000 Browse calls per day — each ebay-candidates run burns
+# ~1 + N calls (1 search + N getItem lookups for descriptions).
 #
-# Quality filters mirror the user's spec:
-#   - seller.feedbackScore >= 5000
-#   - seller.feedbackPercentage >= 98.0
-#   - title doesn't contain obvious junk terms (parts, broken, box only, ...)
-#   - condition = USED, buyingOptions includes FIXED_PRICE (no auctions),
-#     price >= $20 (rules out listing-fee scam prices)
+# Only one server-side pre-filter is applied at fetch time:
+#
+#     seller.feedbackScore >= MIN_SELLER_FEEDBACK (5000)
+#
+# This is NOT a "pick this listing" threshold — it's a noise floor that
+# removes brand-new accounts and one-off sellers so the agent has fewer
+# candidates to review. Everything else — title SKU match, description
+# parsing, "for parts" traps, "box only", "read description" gotchas,
+# suspiciously low prices — is the AI reviewer's job, because reliably
+# detecting scams on eBay requires reading the description and reasoning
+# about intent, which static regex cannot do safely.
 
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 EBAY_BROWSE_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+EBAY_ITEM_URL = "https://api.ebay.com/buy/browse/v1/item/"
 EBAY_SCOPES = "https://api.ebay.com/oauth/api_scope"
 
 MIN_SELLER_FEEDBACK = 5000
-MIN_SELLER_FEEDBACK_PCT = 98.0
-
-# Substrings that disqualify a listing title (case-insensitive)
-EBAY_TITLE_BLOCKLIST = {
-    "box only", "empty box", "for parts", "as is", "as-is", "not working",
-    "broken", "dead", "water damage", "water damaged", "burnt", "burned",
-    "read description", "read desc", "no gpu", "repair only", "cracked",
-    "bent", "mining", "as-parts", "won't boot", "wont boot", "fan only",
-    "heatsink only", "shroud only", "pcb only",
-}
 
 # Target GPUs to search for on eBay. Each tuple is:
 #   (gpu_name, vram_gb, search_query)
@@ -366,91 +368,171 @@ def _ebay_search(token: str, query: str, limit: int = 50) -> list[dict[str, Any]
     return data.get("itemSummaries") or []
 
 
-def _valid_listing(item: dict[str, Any]) -> tuple[bool, str]:
-    """Return (is_valid, reason) for an eBay item summary."""
-    title = (item.get("title") or "").lower()
-    for blocked in EBAY_TITLE_BLOCKLIST:
-        if blocked in title:
-            return False, f"title contains '{blocked}'"
+def _ebay_get_item(token: str, item_id: str) -> dict[str, Any]:
+    """Fetch full item details (including description + shipping) via getItem."""
+    import urllib.parse
+    import urllib.request
 
-    seller = item.get("seller") or {}
-    fb_score = seller.get("feedbackScore")
-    if fb_score is None or int(fb_score) < MIN_SELLER_FEEDBACK:
-        return False, f"seller feedback {fb_score} < {MIN_SELLER_FEEDBACK}"
-
-    fb_pct_raw = seller.get("feedbackPercentage") or "0"
-    try:
-        fb_pct = float(fb_pct_raw)
-    except (TypeError, ValueError):
-        fb_pct = 0.0
-    if fb_pct < MIN_SELLER_FEEDBACK_PCT:
-        return False, f"seller feedback {fb_pct}% < {MIN_SELLER_FEEDBACK_PCT}%"
-
-    return True, "ok"
+    # item_id often comes back as "v1|123|0" — URL-encode it for the path
+    url = EBAY_ITEM_URL + urllib.parse.quote(item_id, safe="")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "gpuscale-dbops/1.0",
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
 
 
-def collect_ebay_prices(
-    targets: list[tuple[str, float, str]] | None = None,
-) -> list[GpuPriceCreate]:
-    """Search eBay for each target GPU, filter to reputable sellers,
-    return the cheapest matching used listing per GPU.
+def _strip_html(html: str, max_chars: int = 1500) -> str:
+    """Quick-and-dirty HTML → plaintext for descriptions the agent will read.
+
+    Not a full parser — just enough to get readable text out of a typical
+    eBay listing description (most are table layouts + free text).
     """
-    targets_list = list(targets) if targets is not None else list(EBAY_TARGETS)
+    import html as html_mod
+    import re
+
+    if not html:
+        return ""
+    # Drop script/style blocks wholesale
+    txt = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    # Replace common block-level tags with newlines so structure survives
+    txt = re.sub(r"<(br|/p|/div|/li|/tr|/h[1-6])[^>]*>", "\n", txt, flags=re.IGNORECASE)
+    # Drop all other tags
+    txt = re.sub(r"<[^>]+>", "", txt)
+    # Decode entities (&amp; &lt; etc.)
+    txt = html_mod.unescape(txt)
+    # Collapse whitespace
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n\s*\n+", "\n\n", txt).strip()
+    if len(txt) > max_chars:
+        txt = txt[:max_chars].rstrip() + "…"
+    return txt
+
+
+def _price_from_item(price_dict: dict[str, Any] | None) -> float:
+    if not price_dict:
+        return 0.0
+    try:
+        return float(price_dict.get("value") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _shipping_from_item(item: dict[str, Any]) -> float | None:
+    opts = item.get("shippingOptions") or []
+    if not opts:
+        return None
+    first = opts[0] or {}
+    cost = first.get("shippingCost") or {}
+    try:
+        return float(cost.get("value") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_ebay_candidates(
+    gpu_name: str,
+    vram_gb: float | None,
+    *,
+    query: str | None = None,
+    limit: int = 10,
+    with_description: bool = True,
+) -> dict[str, Any]:
+    """Fetch eBay candidate listings for review by an external AI agent.
+
+    This does NOT pick a winner — it returns the top `limit` results from
+    the cheapest-first search, each enriched with the full description
+    (via getItem) if `with_description=True`, for an agent to reason over.
+
+    Server-side pre-filter: seller.feedbackScore >= MIN_SELLER_FEEDBACK.
+    No other filters — title SKU match, junk-term detection, scam
+    recognition, price sanity are all the agent's responsibility.
+
+    Returns a dict with `gpu_name`, `query`, `fetched_at`, and
+    `candidates` (list of dicts) — shape is designed for JSON output.
+    """
+    from datetime import datetime, timezone
+
+    if query is None:
+        # Default query: include vram if we know it to separate 16/32 GB variants
+        query = f"Nvidia {gpu_name}"
+        if vram_gb:
+            query += f" {int(vram_gb)}GB"
+
     token = _ebay_mint_token()
+    items = _ebay_search(token, query, limit=max(limit * 2, 20))
 
-    out: list[GpuPriceCreate] = []
-    for gpu_name, vram_gb, query in targets_list:
-        try:
-            items = _ebay_search(token, query, limit=50)
-        except Exception:
-            # One failing query shouldn't stop the batch.
-            continue
-
-        cheapest = None
-        for item in items:
-            ok, _reason = _valid_listing(item)
-            if not ok:
-                continue
-            price = item.get("price") or {}
-            try:
-                value = float(price.get("value") or 0)
-            except (TypeError, ValueError):
-                continue
-            if value <= 0:
-                continue
-            if cheapest is None or value < cheapest["price"]:
-                cheapest = {"price": value, "item": item}
-
-        if cheapest is None:
-            continue
-
-        item = cheapest["item"]
+    # Pre-filter by seller feedback floor — noise reduction only.
+    kept: list[dict[str, Any]] = []
+    for item in items:
         seller = item.get("seller") or {}
-        out.append(
-            GpuPriceCreate(
-                gpu_name=gpu_name,
-                gpu_vram_gb=float(vram_gb),
-                source=PriceSource.EBAY,
-                unit=PriceUnit.ONE_TIME,
-                price_usd=cheapest["price"],
-                listing_url=item.get("itemWebUrl"),
-                seller=seller.get("username"),
-                notes=(
-                    f"Lowest eBay FIXED_PRICE used listing from a seller "
-                    f">= {MIN_SELLER_FEEDBACK} feedback"
-                ),
-                raw_metadata={
-                    "title": item.get("title"),
-                    "condition": item.get("condition"),
-                    "item_id": item.get("itemId"),
-                    "seller_username": seller.get("username"),
-                    "seller_feedback_score": seller.get("feedbackScore"),
-                    "seller_feedback_percentage": seller.get("feedbackPercentage"),
-                    "search_query": query,
+        fb_score = seller.get("feedbackScore")
+        if fb_score is None or int(fb_score) < MIN_SELLER_FEEDBACK:
+            continue
+        kept.append(item)
+
+    # Sort cheapest first (eBay already sorts by price but we re-sort to be safe)
+    kept.sort(key=lambda it: _price_from_item(it.get("price")))
+    kept = kept[:limit]
+
+    candidates: list[dict[str, Any]] = []
+    for rank, item in enumerate(kept, start=1):
+        seller = item.get("seller") or {}
+        price = _price_from_item(item.get("price"))
+        shipping = _shipping_from_item(item)
+        total = price + (shipping or 0.0)
+
+        description = ""
+        if with_description:
+            try:
+                full = _ebay_get_item(token, item.get("itemId") or "")
+                description = _strip_html(full.get("description") or "")
+                # getItem also has shortDescription for some listings
+                if not description:
+                    description = _strip_html(full.get("shortDescription") or "")
+            except Exception as exc:
+                description = f"[failed to fetch description: {exc}]"
+
+        candidates.append(
+            {
+                "rank": rank,
+                "price_usd": round(price, 2),
+                "shipping_usd": round(shipping, 2) if shipping is not None else None,
+                "total_usd": round(total, 2),
+                "condition": item.get("condition"),
+                "title": item.get("title"),
+                "seller": {
+                    "username": seller.get("username"),
+                    "feedback_score": seller.get("feedbackScore"),
+                    "feedback_percentage": seller.get("feedbackPercentage"),
                 },
-            )
+                "listing_url": item.get("itemWebUrl"),
+                "item_id": item.get("itemId"),
+                "description": description,
+            }
         )
-    return out
+
+    return {
+        "gpu_name": gpu_name,
+        "vram_gb": float(vram_gb) if vram_gb else None,
+        "query": query,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "seller_feedback_floor": MIN_SELLER_FEEDBACK,
+        "note": (
+            "eBay candidate listings for review by an AI agent. This tool "
+            "does NOT pick a winner — a reviewer must read each description "
+            "and catch parts-only / 'read description' / SKU mismatch / "
+            "suspiciously-low-price traps manually, then pick one and "
+            "insert via `dbops gpu-price add`."
+        ),
+        "candidates": candidates,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -459,19 +541,17 @@ def collect_ebay_prices(
 
 
 def collect_all_sources() -> dict[str, list[GpuPriceCreate]]:
-    """Run every automated collector (vast DC + community, runpod, ebay) and
-    return a map of source label -> rows.
+    """Run every automated cloud collector and return source -> rows.
 
-    Failures in one collector don't block the others. If a collector raises,
-    its per-source list is empty and the exception is stashed under
-    `"<source>_error"`.
+    eBay is NOT included — it requires AI review (see fetch_ebay_candidates).
+    Failures in one collector don't block the others; the exception is
+    stashed under `"<source>_error"`.
     """
     out: dict[str, list[GpuPriceCreate]] = defaultdict(list)
     for source_label, fn, kwargs in [
         ("vast", collect_vast_prices, {"community": False}),
         ("vast (community)", collect_vast_prices, {"community": True}),
         ("runpod", collect_runpod_prices, {}),
-        ("ebay", collect_ebay_prices, {}),
     ]:
         try:
             out[source_label] = fn(**kwargs)
