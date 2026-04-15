@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Filters from "@/components/Filters";
 import Normalizations from "@/components/Normalizations";
@@ -110,12 +111,25 @@ export default function Home() {
                 </p>
               </div>
             </div>
-            <div className="hidden sm:flex flex-col items-end gap-1">
-              <div className="text-2xl font-bold tabular-nums text-zinc-900 dark:text-zinc-50">
-                {loading ? "…" : displayRows.length}
-              </div>
-              <div className="text-xs uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-                {displayRows.length === 1 ? "result" : "results"}
+            <div className="flex items-center gap-6">
+              <nav className="flex items-center gap-1 text-sm">
+                <span className="rounded-lg px-3 py-2 font-medium text-zinc-900 bg-zinc-100 dark:bg-zinc-900 dark:text-zinc-50">
+                  Leaderboard
+                </span>
+                <Link
+                  href="/report"
+                  className="rounded-lg px-3 py-2 font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-900 dark:hover:text-zinc-100 transition-colors"
+                >
+                  Cost report
+                </Link>
+              </nav>
+              <div className="hidden sm:flex flex-col items-end gap-1">
+                <div className="text-2xl font-bold tabular-nums text-zinc-900 dark:text-zinc-50">
+                  {loading ? "…" : displayRows.length}
+                </div>
+                <div className="text-xs uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+                  {displayRows.length === 1 ? "result" : "results"}
+                </div>
               </div>
             </div>
           </div>
