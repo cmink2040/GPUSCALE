@@ -1,6 +1,7 @@
 "use client";
 
-import type { BenchmarkResult, DisplayRow, SortConfig } from "@/lib/types";
+import { formatCollectedAt } from "@/lib/prices";
+import type { BenchmarkResult, DisplayRow, PriceInfo, SortConfig } from "@/lib/types";
 
 interface ResultsTableProps {
   results: DisplayRow[];
@@ -10,11 +11,14 @@ interface ResultsTableProps {
   topTps?: number;
 }
 
+type ColumnKey = keyof BenchmarkResult | "cost_price" | "rental_price";
+
 interface Column {
-  key: keyof BenchmarkResult;
+  key: ColumnKey;
   label: string;
   format?: (value: unknown) => string;
   align?: "left" | "right";
+  sortable?: boolean; // synthetic price columns are not (yet) sortable
 }
 
 const COLUMNS: Column[] = [
@@ -30,6 +34,18 @@ const COLUMNS: Column[] = [
     label: "Tok/s",
     align: "right",
     format: (v) => (v != null ? Number(v).toFixed(1) : "-"),
+  },
+  {
+    key: "cost_price",
+    label: "Cost (USD)",
+    align: "right",
+    sortable: false,
+  },
+  {
+    key: "rental_price",
+    label: "Rent $/hr",
+    align: "right",
+    sortable: false,
   },
   {
     key: "time_to_first_token_ms",
@@ -76,11 +92,28 @@ const COLUMNS: Column[] = [
   { key: "host_os", label: "OS" },
 ];
 
+function formatCostUSD(n: number): string {
+  if (n >= 1000) return `$${(n / 1000).toFixed(n >= 10000 ? 1 : 2)}k`;
+  return `$${n.toFixed(0)}`;
+}
+
+function formatRentalUSD(n: number): string {
+  return `$${n.toFixed(n < 1 ? 3 : 2)}`;
+}
+
+function priceTooltip(info: PriceInfo, unitLabel: string): string {
+  const parts: string[] = [];
+  parts.push(`${info.source}: $${info.price_usd.toFixed(2)}${unitLabel}`);
+  if (info.seller) parts.push(`seller: ${info.seller}`);
+  parts.push(`collected ${formatCollectedAt(info.collected_at)}`);
+  return parts.join(" · ");
+}
+
 function SortIndicator({
   column,
   sort,
 }: {
-  column: keyof BenchmarkResult;
+  column: ColumnKey;
   sort: SortConfig;
 }) {
   if (sort.column !== column) {
@@ -106,14 +139,18 @@ export default function ResultsTable({
   loading,
   topTps = 0,
 }: ResultsTableProps) {
-  const handleSort = (column: keyof BenchmarkResult) => {
-    if (sort.column === column) {
+  const handleSort = (column: ColumnKey, sortable: boolean) => {
+    // Synthetic columns (cost/rental price) aren't backed by a DB field yet,
+    // so we skip sorting them rather than passing an invalid column to Supabase.
+    if (!sortable) return;
+    const key = column as keyof BenchmarkResult;
+    if (sort.column === key) {
       onSort({
-        column,
+        column: key,
         direction: sort.direction === "asc" ? "desc" : "asc",
       });
     } else {
-      onSort({ column, direction: "desc" });
+      onSort({ column: key, direction: "desc" });
     }
   };
 
@@ -147,18 +184,25 @@ export default function ResultsTable({
             <th className="whitespace-nowrap px-3 py-3 text-right font-semibold text-xs uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
               #
             </th>
-            {COLUMNS.map((col) => (
-              <th
-                key={col.key}
-                onClick={() => handleSort(col.key)}
-                className={`cursor-pointer whitespace-nowrap px-3 py-3 font-semibold text-xs uppercase tracking-wider text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 select-none transition-colors ${
-                  col.align === "right" ? "text-right" : "text-left"
-                }`}
-              >
-                {col.label}
-                <SortIndicator column={col.key} sort={sort} />
-              </th>
-            ))}
+            {COLUMNS.map((col) => {
+              const sortable = col.sortable !== false;
+              return (
+                <th
+                  key={col.key}
+                  onClick={() => handleSort(col.key, sortable)}
+                  className={`whitespace-nowrap px-3 py-3 font-semibold text-xs uppercase tracking-wider text-zinc-500 select-none transition-colors ${
+                    sortable
+                      ? "cursor-pointer hover:text-zinc-900 dark:hover:text-zinc-100"
+                      : "cursor-default"
+                  } dark:text-zinc-400 ${
+                    col.align === "right" ? "text-right" : "text-left"
+                  }`}
+                >
+                  {col.label}
+                  {sortable && <SortIndicator column={col.key} sort={sort} />}
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
@@ -184,6 +228,42 @@ export default function ResultsTable({
                   </span>
                 </td>
                 {COLUMNS.map((col) => {
+                  // Synthetic price columns: render a link + tooltip and move on.
+                  if (col.key === "cost_price" || col.key === "rental_price") {
+                    const info =
+                      col.key === "cost_price" ? row.cost_price : row.rental_price;
+                    const unitLabel = col.key === "cost_price" ? "" : "/hr";
+                    return (
+                      <td
+                        key={col.key}
+                        className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300"
+                      >
+                        {info ? (
+                          <a
+                            href={info.listing_url ?? undefined}
+                            target={info.listing_url ? "_blank" : undefined}
+                            rel="noreferrer"
+                            title={priceTooltip(info, unitLabel)}
+                            className={`inline-flex items-center gap-1 ${
+                              info.listing_url
+                                ? "text-blue-600 hover:underline dark:text-blue-400"
+                                : ""
+                            }`}
+                          >
+                            {col.key === "cost_price"
+                              ? formatCostUSD(info.price_usd)
+                              : formatRentalUSD(info.price_usd)}
+                            <span className="text-[9px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+                              {info.source.replace("vast (community)", "vast-c")}
+                            </span>
+                          </a>
+                        ) : (
+                          <span className="text-zinc-300 dark:text-zinc-600">—</span>
+                        )}
+                      </td>
+                    );
+                  }
+
                   const raw = row[col.key];
                   const display = col.format ? col.format(raw) : (raw ?? "-");
                   const isTps = col.key === "tokens_per_sec";

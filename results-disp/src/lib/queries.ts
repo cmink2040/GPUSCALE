@@ -1,7 +1,8 @@
 import { getSupabase } from "./supabase";
-import type { BenchmarkResult, Filters, SortConfig } from "./types";
+import type { BenchmarkResult, Filters, GpuPrice, SortConfig } from "./types";
 
 const TABLE = "benchmark_results";
+const PRICES_TABLE = "gpu_prices";
 
 export async function fetchResults(
   filters: Filters,
@@ -37,6 +38,24 @@ export async function fetchResults(
   }
 
   return (data as BenchmarkResult[]) ?? [];
+}
+
+// Pull the full gpu_prices table. It's small (<500 rows) so doing this once
+// on page load and de-duping client-side is simpler than a view.
+export async function fetchGpuPrices(): Promise<GpuPrice[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from(PRICES_TABLE)
+    .select("*")
+    .order("collected_at", { ascending: false })
+    .limit(2000);
+
+  if (error) {
+    console.error("Error fetching gpu prices:", error);
+    return [];
+  }
+
+  return (data as GpuPrice[]) ?? [];
 }
 
 export async function fetchDistinctValues(

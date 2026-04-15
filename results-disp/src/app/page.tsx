@@ -4,9 +4,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Filters from "@/components/Filters";
 import Normalizations from "@/components/Normalizations";
 import ResultsTable from "@/components/ResultsTable";
-import { fetchResults, fetchDistinctValues } from "@/lib/queries";
+import { fetchResults, fetchDistinctValues, fetchGpuPrices } from "@/lib/queries";
 import { applyNormalizations } from "@/lib/normalize";
-import type { BenchmarkResult, Filters as FiltersType, NormalizationOpts, SortConfig } from "@/lib/types";
+import { attachPrices, buildPriceLookup } from "@/lib/prices";
+import type { BenchmarkResult, Filters as FiltersType, GpuPrice, NormalizationOpts, SortConfig } from "@/lib/types";
 
 const EMPTY_FILTERS: FiltersType = {
   gpu_name: "",
@@ -35,13 +36,14 @@ const EMPTY_NORM: NormalizationOpts = { weight: false, tier: false };
 
 export default function Home() {
   const [results, setResults] = useState<BenchmarkResult[]>([]);
+  const [prices, setPrices] = useState<GpuPrice[]>([]);
   const [filters, setFilters] = useState<FiltersType>(EMPTY_FILTERS);
   const [normOpts, setNormOpts] = useState<NormalizationOpts>(EMPTY_NORM);
   const [sort, setSort] = useState<SortConfig>(DEFAULT_SORT);
   const [filterOptions, setFilterOptions] = useState<FilterOptions>(EMPTY_OPTIONS);
   const [loading, setLoading] = useState(true);
 
-  // Load filter options on mount
+  // Load filter options + price table on mount (both are small + static-ish).
   useEffect(() => {
     async function loadOptions() {
       const keys = Object.keys(EMPTY_FILTERS) as (keyof FiltersType)[];
@@ -53,6 +55,7 @@ export default function Home() {
       setFilterOptions(opts);
     }
     loadOptions();
+    fetchGpuPrices().then(setPrices);
   }, []);
 
   // Fetch results when filters or sort change
@@ -67,10 +70,14 @@ export default function Home() {
     loadResults();
   }, [loadResults]);
 
-  // Apply normalizations (and possibly merge equivalent rows) before display.
+  // Price lookup is derived purely from the fetched price rows.
+  const priceLookup = useMemo(() => buildPriceLookup(prices), [prices]);
+
+  // Apply normalizations (and possibly merge equivalent rows) before display,
+  // then fold in matched prices so the table has a cell per row.
   const displayRows = useMemo(
-    () => applyNormalizations(results, normOpts),
-    [results, normOpts],
+    () => attachPrices(applyNormalizations(results, normOpts), priceLookup),
+    [results, normOpts, priceLookup],
   );
 
   const topTps = displayRows.length > 0

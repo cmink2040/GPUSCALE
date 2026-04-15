@@ -40,6 +40,33 @@ export interface DisplayRow extends BenchmarkResult {
   normalized?: boolean;         // true if tok/s was transformed
   original_tps?: number;        // raw tok/s prior to normalization, for tooltip
   transform_notes?: string;     // human description of applied transforms
+  // Price lookup attached after fetch. cost = cheapest one-time (ebay/amazon),
+  // rental = cheapest per-hour (vast / vast community / runpod).
+  cost_price?: PriceInfo | null;
+  rental_price?: PriceInfo | null;
+}
+
+// A single row from the gpu_prices table after latest-per-source pivoting.
+export interface GpuPrice {
+  id: string;
+  gpu_name: string;
+  gpu_vram_gb: number;
+  source: "ebay" | "amazon" | "vast" | "vast (community)" | "runpod";
+  unit: "one_time" | "per_hour";
+  price_usd: number;
+  listing_url: string | null;
+  seller: string | null;
+  notes: string | null;
+  collected_at: string;
+}
+
+// Compact form attached to a DisplayRow for rendering a single cell.
+export interface PriceInfo {
+  price_usd: number;
+  source: string;
+  seller: string | null;
+  listing_url: string | null;
+  collected_at: string;
 }
 
 // Toggleable normalization knobs. Adding a new toggle = adding a key here +
